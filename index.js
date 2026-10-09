@@ -6,16 +6,19 @@
  * 简短提示与错误仍为文字；#jm<数字> 发送加密 PDF。
  *
  * 命令：
- *   #jm<数字>                  下载该作为加密 PDF（密码 = 通用密码 + ID）
+ *   #jm<数字>                  下载该作为加密 PDF（双密码：通用密码 或 ID）
  *   #jmpdf <JM号> [章节序号]    同上，可指定单章
  *   #jm密码 [新密码|清空]       设置/查看/清空通用密码
- *   #jm搜索 <关键词|JM号|链接>
- *   #jm详情 <JM号>
- *   #jm章节 <JM号>
+ *   #jm搜索 <关键词> [页码]     搜索（支持翻页）
+ *   #jm下一页 / #jm上一页      搜索结果翻页
+ *   #jm详情 <JM号> / #jm章节 <JM号>
  *   #jm看 <JM号> [章节序号]    章节文字信息
  *   #jm热门 / #jm随机 / #jm分类
  *   #jm登录 <用户名> <密码> / #jm退出
  *   #jm收藏 / #jm历史
+ *   #jm删除 <JM号> [章节]      主人：删除单个缓存
+ *   #jm清缓存                  主人：清空全部缓存
+ *   #jm缓存                    主人：查看缓存列表
  *   #jm帮助
  *
  * 免责声明：本插件为个人学习与技术研究用途，与 18comic / JMComic / 禁漫天堂无任何关联。
@@ -27,15 +30,36 @@ import makeConfig from '../../lib/plugins/config.js'
 import JmClient from './apps/jmcore.js'
 import JmRepository, { buildComicPdf } from './apps/jm.js'
 import { renderDetailCard, renderChaptersCard, renderListCard } from './apps/render.js'
+import { getCachedPdf, putCachedPdf, removeCachedPdf, listCache } from './apps/store.js'
 
 const client = new JmClient()
 const repo = new JmRepository(client)
 
 // 插件配置：config/jmreader.yaml
-//   pdfPassword: PDF 通用密码前缀，最终密码 = 通用密码 + 漫画ID
+//   pdfPassword: PDF 通用密码（userPassword），与作品 id（ownerPassword）双密码
+//   pageSize:    列表每页显示条数
+//   imageQuality:图片质量 0-100（预留，暂未接）
 const { config, configSave } = await makeConfig('jmreader', {
   pdfPassword: '',
+  pageSize: 10,
+  imageQuality: 82,
 })
+
+// 锅巴网页配置回写钩子：锅巴面板保存时调用，同步到本插件配置并持久化
+globalThis.__jmreaderConfig = config
+globalThis.__jmreaderSetConfig = (data) => {
+  if (!data || typeof data !== 'object') return
+  if ('pdfPassword' in data) config.pdfPassword = data.pdfPassword ?? ''
+  if ('pageSize' in data) {
+    const n = parseInt(data.pageSize, 10)
+    config.pageSize = Number.isFinite(n) && n > 0 ? Math.min(n, 20) : 10
+  }
+  if ('imageQuality' in data) {
+    const q = parseInt(data.imageQuality, 10)
+    config.imageQuality = Number.isFinite(q) && q >= 0 ? Math.min(q, 100) : 82
+  }
+  configSave().catch(() => {})
+}
 
 export class JMReader extends plugin {
   constructor() {
@@ -60,6 +84,11 @@ export class JMReader extends plugin {
         { reg: new RegExp('^#?jm(pdf|下载|download|导出)\\s*(.*)$', 'i'), fnc: 'pdf' },
         { reg: new RegExp('^#?jm(帮助|help|说明|菜单)\\s*$', 'i'), fnc: 'help' },
         { reg: new RegExp('^#?jm(密码|password|密碼)\\s*(.*)$', 'i'), fnc: 'setPassword' },
+        { reg: new RegExp('^#?jm(下一页|下页|next)\\s*$', 'i'), fnc: 'nextPage' },
+        { reg: new RegExp('^#?jm(上一页|上页|prev|previous)\\s*$', 'i'), fnc: 'prevPage' },
+        { reg: new RegExp('^#?jm(删除|删|del|delete)\\s*(.*)$', 'i'), fnc: 'delResource', permission: 'master' },
+        { reg: new RegExp('^#?jm(清缓存|清除缓存|clearcache)\\s*$', 'i'), fnc: 'clearCache', permission: 'master' },
+        { reg: new RegExp('^#?jm(缓存列表|缓存|cache)\\s*$', 'i'), fnc: 'cacheList', permission: 'master' },
       ],
     })
   }
@@ -101,31 +130,117 @@ export class JMReader extends plugin {
   // 命令处理
   // -------------------------------------------------------------------------
 
+  // 搜索会话（按 user_id + group_id 区分），用于翻页
+  searchSessions = new Map()
+
+  /** 每页条数（配置）。 */
+  get pageSize() {
+    const n = parseInt(config.pageSize, 10)
+    return Number.isFinite(n) && n > 0 ? Math.min(n, 20) : 10
+  }
+
+  /**
+   * 拉取「本地第 localPage 页」的搜索数据。
+   * 服务端每页固定 80 条，本地按 pageSize 切片，跨服务端页时自动请求对应服务端页。
+   * @returns {Promise<{ items, total, localPage, totalPages }>}
+   */
+  async _fetchSearchPage(kw, localPage) {
+    const pageSize = this.pageSize
+    // 服务端每页固定 80 条
+    const SERVER_PAGE = 80
+    const globalStart = (localPage - 1) * pageSize // 全局起始下标（0 起）
+    const serverPage = Math.floor(globalStart / SERVER_PAGE) + 1
+    const offsetInServer = globalStart % SERVER_PAGE
+
+    const r = await repo.search(kw, serverPage, 'site')
+    const all = r.items
+    const slice = all.slice(offsetInServer, offsetInServer + pageSize)
+    return {
+      items: slice,
+      total: r.total,
+      localPage,
+      totalPages: Math.max(1, Math.ceil(r.total / pageSize)),
+      redirectAid: r.redirectAid,
+    }
+  }
+
   async search(e) {
-    const kw = (e.msg.match(/^#?jm(?:搜索|搜|search)\s*(.*)$/i) || [])[1]?.trim()
-    if (!kw) {
-      await e.reply('用法：#jm搜索 <关键词|JM号|链接>')
+    const text = (e.msg.match(/^#?jm(?:搜索|搜|search)\s*(.*)$/i) || [])[1]?.trim()
+    if (!text) {
+      await e.reply('用法：#jm搜索 <关键词|JM号|链接> [页码]')
       return true
     }
+    // 支持末尾带页码：如「妹妹 2」
+    let kw = text
+    let page = 1
+    const m = text.match(/^(.*?)\s+(\d{1,2})\s*$/)
+    if (m && m[2]) {
+      kw = m[1].trim() || text
+      page = parseInt(m[2], 10)
+    }
     const reply = await this.wrap(async () => {
-      const r = await repo.search(kw, 1, 'site')
+      const r = await this._fetchSearchPage(kw, page)
       // 纯数字 => 直接跳详情
       if (r.redirectAid) {
         const d = await repo.getAlbum(r.redirectAid)
         return { png: await renderDetailCard(d) }
       }
-      if (!r.items.length) return `没有找到「${kw}」相关作品`
-      const items = r.items.slice(0, 10).map((it, i) => ({
-        no: `${i + 1}.`,
+      if (!r.items.length) return `没有找到「${kw}」相关作品（或该页无结果）`
+      // 记录会话，供翻页
+      const sessionKey = `${e.isGroup ? 'g' : 'p'}:${e.isGroup ? e.group_id : e.user_id}`
+      this.searchSessions.set(sessionKey, { kw, page: r.localPage, total: r.total })
+
+      const items = r.items.map((it, i) => ({
+        no: `${(r.localPage - 1) * this.pageSize + i + 1}.`,
         name: it.name,
         author: it.author || '',
         id: it.id || '',
       }))
-      const more = r.total > 10 ? `… 共 ${r.total} 条，用「#jm详情 JM号」查看` : ''
-      return { png: await renderListCard({ title: `搜索：${kw}`, badge: '', items, more }) }
+      const more = r.totalPages > 1
+        ? `第 ${r.localPage}/${r.totalPages} 页 · 共 ${r.total} 条 · 回复「#jm下一页」/「#jm上一页」翻页`
+        : `共 ${r.total} 条`
+      return { png: await renderListCard({ title: `搜索：${kw}`, badge: `P${r.localPage}`, items, more }) }
     })
     await this.send(e, reply)
     return true
+  }
+
+  /** 翻页（上一页/下一页共用）。 */
+  async _turnPage(e, delta) {
+    const sessionKey = `${e.isGroup ? 'g' : 'p'}:${e.isGroup ? e.group_id : e.user_id}`
+    const sess = this.searchSessions.get(sessionKey)
+    if (!sess) {
+      await e.reply('没有正在进行的搜索，请先 #jm搜索 <关键词>')
+      return true
+    }
+    const next = sess.page + delta
+    if (next < 1) {
+      await e.reply('已经是第一页了')
+      return true
+    }
+    const reply = await this.wrap(async () => {
+      const r = await this._fetchSearchPage(sess.kw, next)
+      if (!r.items.length) return '已经是最后一页了'
+      sess.page = r.localPage
+      const items = r.items.map((it, i) => ({
+        no: `${(r.localPage - 1) * this.pageSize + i + 1}.`,
+        name: it.name,
+        author: it.author || '',
+        id: it.id || '',
+      }))
+      const more = `第 ${r.localPage}/${r.totalPages} 页 · 共 ${r.total} 条 · 回复「#jm下一页」/「#jm上一页」翻页`
+      return { png: await renderListCard({ title: `搜索：${sess.kw}`, badge: `P${r.localPage}`, items, more }) }
+    })
+    await this.send(e, reply)
+    return true
+  }
+
+  async nextPage(e) {
+    return this._turnPage(e, 1)
+  }
+
+  async prevPage(e) {
+    return this._turnPage(e, -1)
   }
 
   async detail(e) {
@@ -262,14 +377,14 @@ export class JMReader extends plugin {
         `用法：\n` +
         `#jm密码 <新密码>  设置通用密码\n` +
         `#jm密码 清空      清空通用密码\n\n` +
-        `PDF 密码 = 通用密码 + 漫画ID`,
+        `PDF 双密码：通用密码 或 作品ID，二选一即可打开`,
       )
       return true
     }
     if (/^(清空|清除|clear|reset|空)$/i.test(text)) {
       config.pdfPassword = ''
       await configSave()
-      await e.reply('✅ 通用密码已清空（PDF 密码将仅 = 漫画ID）')
+      await e.reply('✅ 通用密码已清空（PDF 将仅可用作品ID打开）')
       return true
     }
     // 限制长度，避免异常输入
@@ -279,7 +394,7 @@ export class JMReader extends plugin {
     }
     config.pdfPassword = text
     await configSave()
-    await e.reply(`✅ 通用密码已设置为「${text}」\n之后的 PDF 密码 = ${text} + 漫画ID`)
+    await e.reply(`✅ 通用密码已设置为「${text}」\n之后的 PDF 双密码：通用密码「${text}」或 作品ID，二选一即可打开`)
     return true
   }
 
@@ -326,9 +441,21 @@ export class JMReader extends plugin {
     }
     const chapterIdx = parts[1] ? parseInt(parts[1], 10) : null
 
-    // 密码 = 通用密码 + 漫画ID
+    // 双密码：通用密码（userPassword）+ 作品 id（ownerPassword）
     const commonPwd = (config.pdfPassword || '').trim()
-    const password = commonPwd + id
+    const userPassword = commonPwd
+    const ownerPassword = id
+
+    // 先查缓存
+    const cached = await getCachedPdf(id, chapterIdx)
+    if (cached) {
+      // 命中缓存，直接发
+      await e.reply([
+        `📕《${cached.meta.name || `JM${id}`}》JM${id}（缓存）已生成加密 PDF（${cached.meta.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`,
+        segment.file(cached.file, `${id}${chapterIdx != null ? `_c${chapterIdx}` : ''}.pdf`),
+      ])
+      return true
+    }
 
     await e.reply('⏳ 正在下载并生成加密 PDF，可能需要一会儿…')
     try {
@@ -338,34 +465,75 @@ export class JMReader extends plugin {
         repo,
         id,
         chapterIdx,
-        password,
+        userPassword,
+        ownerPassword,
         (done, total) => {
           if (done % 10 === 0 || done === total) {
             e.reply(`⏳ 已处理 ${done}/${total} 页…`, false, { recallMsg: 5 }).catch(() => {})
           }
         },
       )
-      // 写到临时文件，用 segment.file 发送（比 base64 更兼容各协议端）
-      const { writeFile, mkdtemp, rm } = await import('node:fs/promises')
-      const { tmpdir } = await import('node:os')
-      const path = await import('node:path')
-      const dir = await mkdtemp(path.join(tmpdir(), 'jmreader-'))
-      // 文件名直接用作品 id.pdf
-      const filePath = path.join(dir, `${id}.pdf`)
-      await writeFile(filePath, result.buf)
+      // 持久化缓存
+      await putCachedPdf(id, chapterIdx, result.buf, {
+        name: result.name,
+        pageCount: result.pageCount,
+        userPassword,
+        ownerPassword,
+      })
+      const rec = await getCachedPdf(id, chapterIdx)
+      const fileName = `${id}${chapterIdx != null ? `_c${chapterIdx}` : ''}.pdf`
 
       try {
         await e.reply([
-          `📕《${result.name}》JM${id} 已生成加密 PDF（${result.pageCount} 页）\n🔑 密码：${password}`,
-          segment.file(filePath, `${id}.pdf`),
+          `📕《${result.name}》JM${id} 已生成加密 PDF（${result.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`,
+          segment.file(rec.file, fileName),
         ])
-      } finally {
-        // 稍后清理临时文件
-        setTimeout(() => rm(dir, { recursive: true, force: true }).catch(() => {}), 60000)
+      } catch {
+        await e.reply('生成失败，请重试')
       }
     } catch (err) {
       await e.reply(`❌ ${err.serverMessage || err.message || '生成 PDF 失败'}`)
     }
+    return true
+  }
+
+  /** 主人删除单个缓存资源。 */
+  async delResource(e) {
+    const text = (e.msg.match(/^#?jm(?:删除|删|del|delete)\s*(.*)$/i) || [])[1]?.trim()
+    const id = this.parseId(text)
+    if (!id) {
+      await e.reply('用法：#jm删除 <JM号> [章节序号]\n删除指定作品的缓存 PDF；#jm清缓存 清空全部')
+      return true
+    }
+    const parts = text.split(/\s+/).filter(Boolean)
+    const chapterIdx = parts[1] ? parseInt(parts[1], 10) : null
+    const n = await removeCachedPdf(id, chapterIdx)
+    await e.reply(n > 0 ? `✅ 已删除 JM${id}${chapterIdx != null ? ` 第${chapterIdx}章` : ''} 的缓存 PDF` : `未找到 JM${id} 的缓存`)
+    return true
+  }
+
+  /** 主人清空全部缓存。 */
+  async clearCache(e) {
+    const n = await removeCachedPdf('all')
+    await e.reply(`✅ 已清空缓存，删除 ${n} 个 PDF 文件`)
+    return true
+  }
+
+  /** 主人查看缓存列表。 */
+  async cacheList(e) {
+    const list = await listCache()
+    if (!list.length) {
+      await e.reply('暂无缓存')
+      return true
+    }
+    const totalSize = list.reduce((s, it) => s + (it.size || 0), 0)
+    const lines = list.slice(0, 20).map((it) => {
+      const mb = ((it.size || 0) / 1024 / 1024).toFixed(1)
+      const ch = it.chapter != null ? ` 第${it.chapter}章` : ''
+      return `· ${it.name || `JM${it.id}`} (${it.id}${ch}) ${mb}MB`
+    })
+    const more = list.length > 20 ? `\n… 共 ${list.length} 个，总计 ${(totalSize / 1024 / 1024).toFixed(1)}MB` : `\n总计 ${(totalSize / 1024 / 1024).toFixed(1)}MB`
+    await e.reply(`📦 缓存列表（${list.length} 个）：\n${lines.join('\n')}${more}\n\n#jm删除 <JM号> 删除单个，#jm清缓存 清空全部`)
     return true
   }
 
@@ -376,19 +544,19 @@ export class JMReader extends plugin {
         { no: '', name: '#jm<数字>', sub: '下载该作为加密 PDF，如 #jm1480269' },
         { no: '', name: '#jmpdf <JM号> [章节]', sub: '下载为加密 PDF（不填章节=整本）' },
         { no: '', name: '#jm密码 <新密码>', sub: '设置/查看/清空通用密码' },
-        { no: '', name: '#jm搜索 <关键词|JM号|链接>', sub: '搜索作品' },
-        { no: '', name: '#jm详情 <JM号>', sub: '查看详情' },
-        { no: '', name: '#jm章节 <JM号>', sub: '章节列表' },
+        { no: '', name: '#jm搜索 <关键词> [页码]', sub: '搜索作品（可翻页）' },
+        { no: '', name: '#jm下一页 / #jm上一页', sub: '搜索结果翻页' },
+        { no: '', name: '#jm详情 <JM号> / #jm章节 <JM号>', sub: '详情 / 章节' },
         { no: '', name: '#jm看 <JM号> [章节]', sub: '章节文字信息' },
         { no: '', name: '#jm热门 / #jm随机 / #jm分类', sub: '发现作品' },
-        { no: '', name: '#jm登录 <用户名> <密码>', sub: '登录会员' },
-        { no: '', name: '#jm退出 / #jm收藏 / #jm历史', sub: '会员功能' },
+        { no: '', name: '#jm登录 / #jm退出 / #jm收藏 / #jm历史', sub: '会员功能' },
+        { no: '', name: '#jm删除 <JM号> / #jm清缓存', sub: '主人：删除/清空缓存' },
       ]
       const png = await renderListCard({
         title: 'JMReader 命令',
         badge: 'HELP',
         items,
-        more: '🔒 PDF 密码 = 通用密码 + 漫画ID（用 #jm密码 设置/修改）',
+        more: '🔒 PDF 双密码：通用密码 或 作品ID 二选一打开（用 #jm密码 设置通用密码）',
       })
       await e.reply(segment.image(`base64://${png.toString('base64')}`))
     } catch {
