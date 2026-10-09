@@ -1,6 +1,6 @@
 # JMReader 插件（TRSS-Yunzai）
 
-把 [JM Reader](https://github.com/)（一个 Kotlin + Jetpack Compose 的漫画阅读器）的核心能力移植到 **TRSS-Yunzai** QQ 机器人上，用 Node.js 复刻了它的完整网络协议（主机发现、请求签名、AES 响应解密、图片打乱还原）。
+把 [JM Reader](https://github.com/](https://github.com/Aether-1013/jm-reader)（一个 Kotlin + Jetpack Compose 的漫画阅读器）的核心能力移植到 **TRSS-Yunzai** QQ 机器人上，用 Node.js 复刻了它的完整网络协议（主机发现、请求签名、AES 响应解密、图片打乱还原）。
 
 > [!IMPORTANT]
 > ## ⚠️ 免责声明（请务必完整阅读）
@@ -56,14 +56,14 @@
 
 ```bash
 cd Yunzai
-git clone https://github.com/zqyaila/JM-plugin ./plugins/jmreader-plugin/
+git clone https://github.com/zqyaila/JM-plugin ./plugins/JM-plugin/
 ```
 
 
 然后进入插件目录安装依赖（图片打乱还原 + PDF 生成）：
 
 ```bash
-cd plugins/jmreader-plugin
+cd plugins/JM-plugin
 npm install
 ```
 
@@ -72,7 +72,7 @@ npm install
 ### 更新插件
 
 ```bash
-cd plugins/jmreader-plugin
+cd plugins/JM-plugin
 git pull
 npm install
 ```
