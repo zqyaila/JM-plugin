@@ -1,0 +1,15 @@
+{
+  "name": "jmreader-plugin",
+  "version": "1.0.0",
+  "description": "JM Reader 漫画阅读器 —— TRSS-Yunzai 插件（搜索/详情/阅读/登录）",
+  "type": "module",
+  "main": "index.js",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "@muhammara/wasm": "^1.1.0",
+    "sharp": "^0.35.5"
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check apps/jmcore.js && node --check apps/jm.js"
+  }
+}
