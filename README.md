@@ -110,7 +110,7 @@
 
 ```bash
 cd Yunzai
-git clone <仓库地址> ./plugins/jmreader-plugin/
+git clone [<仓库地址>](https://github.com/zqyaila/JM-plugin) ./plugins/jmreader-plugin/
 ```
 
 > 将 `<仓库地址>` 替换为本项目的实际 Git 地址（GitHub / Gitee 等均可）。
