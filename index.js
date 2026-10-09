@@ -28,7 +28,7 @@
 import plugin from '../../lib/plugins/plugin.js'
 import makeConfig from '../../lib/plugins/config.js'
 import JmClient from './apps/jmcore.js'
-import JmRepository, { buildComicPdf } from './apps/jm.js'
+import JmRepository, { buildComicPdf, countComicPages } from './apps/jm.js'
 import { renderDetailCard, renderChaptersCard, renderListCard } from './apps/render.js'
 import { getCachedPdf, putCachedPdf, removeCachedPdf, listCache } from './apps/store.js'
 
@@ -36,13 +36,17 @@ const client = new JmClient()
 const repo = new JmRepository(client)
 
 // 插件配置：config/jmreader.yaml
-//   pdfPassword: PDF 通用密码（userPassword），与作品 id（ownerPassword）双密码
-//   pageSize:    列表每页显示条数
-//   imageQuality:图片质量 0-100（预留，暂未接）
+//   pdfPassword:        PDF 通用密码（userPassword），与作品 id（ownerPassword）双密码
+//   pageSize:           列表每页显示条数
+//   imageQuality:       图片质量 0-100
+//   maxPages:           PDF 最大页数限制（0 = 不限制），超过则拒绝并提示
+//   downloadConcurrency: 下载图片并发数（1-10）
 const { config, configSave } = await makeConfig('jmreader', {
   pdfPassword: '',
   pageSize: 10,
   imageQuality: 82,
+  maxPages: 0,
+  downloadConcurrency: 4,
 })
 
 // 锅巴网页配置回写钩子：锅巴面板保存时调用，同步到本插件配置并持久化
@@ -57,6 +61,14 @@ globalThis.__jmreaderSetConfig = (data) => {
   if ('imageQuality' in data) {
     const q = parseInt(data.imageQuality, 10)
     config.imageQuality = Number.isFinite(q) && q >= 0 ? Math.min(q, 100) : 82
+  }
+  if ('maxPages' in data) {
+    const m = parseInt(data.maxPages, 10)
+    config.maxPages = Number.isFinite(m) && m > 0 ? m : 0
+  }
+  if ('downloadConcurrency' in data) {
+    const c = parseInt(data.downloadConcurrency, 10)
+    config.downloadConcurrency = Number.isFinite(c) && c > 0 ? Math.min(c, 10) : 4
   }
   configSave().catch(() => {})
 }
@@ -137,6 +149,18 @@ export class JMReader extends plugin {
   get pageSize() {
     const n = parseInt(config.pageSize, 10)
     return Number.isFinite(n) && n > 0 ? Math.min(n, 20) : 10
+  }
+
+  /** PDF 最大页数限制（配置，0 = 不限制）。 */
+  get maxPages() {
+    const n = parseInt(config.maxPages, 10)
+    return Number.isFinite(n) && n > 0 ? n : 0
+  }
+
+  /** 下载并发数（配置，默认 4）。 */
+  get downloadConcurrency() {
+    const n = parseInt(config.downloadConcurrency, 10)
+    return Number.isFinite(n) && n > 0 ? Math.min(n, 10) : 4
   }
 
   /**
@@ -430,6 +454,28 @@ export class JMReader extends plugin {
     return true
   }
 
+  /** 发送 PDF 文件，带兜底与友好错误提示。 */
+  async _sendPdfFile(e, filePath, fileName, headMsg) {
+    try {
+      await e.reply([headMsg, segment.file(filePath, fileName)])
+      return
+    } catch (err) {
+      // 上传失败（如 QQ 群文件 210005）兜底：读字节转 base64 直发一次
+      try {
+        const { readFile } = await import('node:fs/promises')
+        const buf = await readFile(filePath)
+        await e.reply([headMsg, segment.file(`base64://${buf.toString('base64')}`, fileName)])
+      } catch (err2) {
+        const msg = err2?.message || err?.message || ''
+        let tip = '请稍后重试，或改在私聊里发送。'
+        if (/210005|HTTP Upload|httpUpload/i.test(msg)) {
+          tip = 'QQ 群文件上传被拒（可能群文件空间已满，或短时间重复上传同一文件）。\n建议：清理群文件空间后重试，或改在私聊里发送（私聊文件不受群空间限制）。'
+        }
+        await e.reply(`❌ 文件发送失败：${msg}\n${tip}`)
+      }
+    }
+  }
+
   async pdf(e) {
     // 兼容两种触发形式：#jm1480269（纯数字）或 #jmpdf 1480269 [章节]
     const text = (e.msg.match(/^#?jm(?:pdf|下载|download|导出)?\s*(.*)$/i) || [])[1]?.trim()
@@ -446,18 +492,37 @@ export class JMReader extends plugin {
     const userPassword = commonPwd
     const ownerPassword = id
 
+    // 最大页数限制 + 预计时间：用 comicRead 拿真实页数（含单行本）
+    const maxPages = this.maxPages
+    let totalPage = 0
+    try {
+      await this.ensureBootstrap()
+      totalPage = await countComicPages(repo, id, chapterIdx)
+      if (maxPages > 0 && totalPage > maxPages) {
+        await e.reply(`❌ 该漫画共 ${totalPage} 页，超过最大页数限制（${maxPages} 页）\n请改用单章下载：#jmpdf ${id} <章节序号>，或联系主人调高限制`)
+        return true
+      }
+    } catch {}
+
     // 先查缓存
     const cached = await getCachedPdf(id, chapterIdx)
     if (cached) {
       // 命中缓存，直接发
-      await e.reply([
-        `📕《${cached.meta.name || `JM${id}`}》JM${id}（缓存）已生成加密 PDF（${cached.meta.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`,
-        segment.file(cached.file, `${id}${chapterIdx != null ? `_c${chapterIdx}` : ''}.pdf`),
-      ])
+      const headMsg = `📕《${cached.meta.name || `JM${id}`}》JM${id}（缓存）已生成加密 PDF（${cached.meta.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
+      const fileName = `${id}${chapterIdx != null ? `_c${chapterIdx}` : ''}.pdf`
+      await this._sendPdfFile(e, cached.file, fileName, headMsg)
       return true
     }
 
-    await e.reply('⏳ 正在下载并生成加密 PDF，可能需要一会儿…')
+    // 估算预计时间（按并发数折算）
+    const concurrency = this.downloadConcurrency
+    let estimate = ''
+    if (totalPage > 0) {
+      // 每页约 1.5s，并发后总时间 ≈ 页数 × 1.5 / 并发
+      const secs = Math.ceil((totalPage * 1.5) / concurrency)
+      estimate = `预计 ${totalPage} 页，约 ${secs > 60 ? Math.round(secs / 60) + ' 分钟' : secs + ' 秒'}`
+    }
+    await e.reply(`⏳ 正在下载并生成加密 PDF…${estimate ? `\n📊 ${estimate}` : ''}`)
     try {
       await this.ensureBootstrap()
       const result = await buildComicPdf(
@@ -467,11 +532,8 @@ export class JMReader extends plugin {
         chapterIdx,
         userPassword,
         ownerPassword,
-        (done, total) => {
-          if (done % 10 === 0 || done === total) {
-            e.reply(`⏳ 已处理 ${done}/${total} 页…`, false, { recallMsg: 5 }).catch(() => {})
-          }
-        },
+        () => {}, // 不逐条发进度，避免刷屏
+        { concurrency, retries: 3, retryDelay: 2000, quality: parseInt(config.imageQuality, 10) || 82 },
       )
       // 持久化缓存
       await putCachedPdf(id, chapterIdx, result.buf, {
@@ -483,14 +545,8 @@ export class JMReader extends plugin {
       const rec = await getCachedPdf(id, chapterIdx)
       const fileName = `${id}${chapterIdx != null ? `_c${chapterIdx}` : ''}.pdf`
 
-      try {
-        await e.reply([
-          `📕《${result.name}》JM${id} 已生成加密 PDF（${result.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`,
-          segment.file(rec.file, fileName),
-        ])
-      } catch {
-        await e.reply('生成失败，请重试')
-      }
+      const headMsg = `📕《${result.name}》JM${id} 已生成加密 PDF（${result.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
+      await this._sendPdfFile(e, rec.file, fileName, headMsg)
     } catch (err) {
       await e.reply(`❌ ${err.serverMessage || err.message || '生成 PDF 失败'}`)
     }

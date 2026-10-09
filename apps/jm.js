@@ -90,6 +90,42 @@ async function rawGet(url) {
   }
 }
 
+/** 休眠。 */
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+/**
+ * 带重试的图片下载：失败重试 retries 次，每次间隔 retryDelay ms。
+ * @returns {Promise<{ buf: Buffer, ext: string, descrambled: boolean }>}
+ */
+export async function fetchPageImageRetry(client, url, aid, scrambleId, { retries = 3, retryDelay = 2000 } = {}) {
+  let lastErr
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fetchPageImage(client, url, aid, scrambleId)
+    } catch (e) {
+      lastErr = e
+      if (i < retries) await sleep(retryDelay)
+    }
+  }
+  throw lastErr || new Error('图片下载失败')
+}
+
+/** 并发控制：限制同时执行的任务数。 */
+async function mapConcurrent(items, limit, fn) {
+  const results = new Array(items.length)
+  let idx = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (idx < items.length) {
+      const i = idx++
+      results[i] = await fn(items[i], i)
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
 function fileName(url) {
   const path = String(url).split('?')[0]
   const seg = path.split('/').pop()
@@ -420,9 +456,11 @@ async function loadMuhammara() {
  * @param {string} userPassword 用户密码（通用密码）
  * @param {string} ownerPassword 所有者密码（作品 id）
  * @param {function} [onProgress] 进度回调 (done, total)
+ * @param {object} [opts] 额外选项 { concurrency=4, retries=3, retryDelay=2000, quality=82 }
  * @returns {Promise<{ buf: Buffer, pageCount: number, userPassword: string, ownerPassword: string, name: string }>}
  */
-export async function buildComicPdf(client, repo, albumId, chapterIdx = null, userPassword = '', ownerPassword = '', onProgress) {
+export async function buildComicPdf(client, repo, albumId, chapterIdx = null, userPassword = '', ownerPassword = '', onProgress, opts = {}) {
+  const { concurrency = 4, retries = 3, retryDelay = 2000, quality = 82 } = opts
   const m = await loadMuhammara()
   if (!m) throw new Error('未安装 @muhammara/wasm，无法生成 PDF')
   const sharp = await loadSharp()
@@ -470,10 +508,17 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
     version: m.ePDFVersion17,
   })
 
-  let done = 0
-  for (const pg of allPages) {
-    const { buf } = await fetchPageImage(client, pg.url, pg.aid, pg.scrambleId)
-    // 统一转成 JPEG（限制最大边，控制体积）
+  // 阶段一：并发下载所有页（每张失败重试 retries 次，间隔 retryDelay ms）
+  if (onProgress) onProgress(0, allPages.length)
+  const downloaded = await mapConcurrent(allPages, concurrency, async (pg, i) => {
+    const r = await fetchPageImageRetry(client, pg.url, pg.aid, pg.scrambleId, { retries, retryDelay })
+    if (onProgress) onProgress(i + 1, allPages.length)
+    return r
+  })
+
+  // 阶段二：按顺序转 JPEG 并嵌入 PDF（保证页序正确）
+  for (let i = 0; i < downloaded.length; i++) {
+    const { buf } = downloaded[i]
     let jpeg = buf
     try {
       const meta = await sharp(buf).metadata()
@@ -481,10 +526,10 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
       if (meta.width > max || meta.height > max) {
         jpeg = await sharp(buf)
           .resize({ width: max, height: max, fit: 'inside', withoutEnlargement: true })
-          .jpeg({ quality: 82 })
+          .jpeg({ quality })
           .toBuffer()
       } else {
-        jpeg = await sharp(buf).jpeg({ quality: 82 }).toBuffer()
+        jpeg = await sharp(buf).jpeg({ quality }).toBuffer()
       }
     } catch {
       // 转码失败就用原字节
@@ -494,8 +539,6 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
     const ctx = writer.startPageContentContext(page)
     ctx.drawImage(0, 0, jpeg, { transformation: { width, height } })
     writer.writePage(page)
-    done++
-    if (onProgress) onProgress(done, allPages.length)
   }
 
   const bytes = writer.end()
@@ -506,6 +549,30 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
     ownerPassword: op,
     name: detail.name || `JM${albumId}`,
   }
+}
+
+/**
+ * 统计一部漫画（整本或单章）的总页数，用于预计下载时间。
+ * @returns {Promise<number>}
+ */
+export async function countComicPages(repo, albumId, chapterIdx = null) {
+  const detail = await repo.getAlbum(albumId)
+  const series = detail.series.length
+    ? detail.series
+    : [{ id: detail.id, name: detail.name, sort: 1 }]
+  let chapters
+  if (chapterIdx != null) {
+    const ch = series.find((s) => s.sort === chapterIdx) || series[0]
+    chapters = [ch]
+  } else {
+    chapters = series
+  }
+  let total = 0
+  for (const ch of chapters) {
+    const rd = await repo.comicRead(ch.id)
+    total += rd.images.length || rd.totalPage || 0
+  }
+  return total
 }
 
 export default JmRepository

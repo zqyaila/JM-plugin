@@ -166,14 +166,16 @@ jmreader-plugin/
 本插件配置保存在 Yunzai 的 `config/jmreader.yaml`（首次运行自动生成）：
 
 ```yaml
-pdfPassword: ''   # PDF 通用密码（userPassword），与作品ID（ownerPassword）构成双密码
-pageSize: 10      # 列表每页显示条数（1-20）
-imageQuality: 82  # PDF 内页 JPEG 压缩质量（0-100，预留）
+pdfPassword: ''        # PDF 通用密码（userPassword），与作品ID（ownerPassword）构成双密码
+pageSize: 10           # 列表每页显示条数（1-20）
+imageQuality: 82       # PDF 内页 JPEG 压缩质量（0-100）
+maxPages: 0            # PDF 最大页数限制（0 = 不限制），超过则拒绝并提示
+downloadConcurrency: 4 # 下载图片并发数（1-10）
 ```
 
 可通过两种方式修改：
 
-- **锅巴面板**（推荐）：装好 [guoba-plugin-next](https://github.com/cchanlan/guoba-plugin-next) 后，本插件配置会自动出现在锅巴面板里，可视化修改通用密码、每页条数等。
+- **锅巴面板**（推荐）：装好 [guoba-plugin-next](https://github.com/cchanlan/guoba-plugin-next) 后，本插件配置会自动出现在锅巴面板里，可视化修改通用密码、每页条数、最大页数等。
 - **命令**：`#jm密码 <新密码>` 设置通用密码、`#jm密码 清空` 清空。
 
 其余无需额外配置即可使用（主机自动发现）。如需调整：
@@ -189,7 +191,9 @@ imageQuality: 82  # PDF 内页 JPEG 压缩质量（0-100，预留）
 | --- | --- | --- |
 | `pdfPassword` | Input | PDF 通用密码 |
 | `pageSize` | InputNumber | 每页显示条数（1-20） |
-| `imageQuality` | InputNumber | 图片压缩质量（0-100，预留） |
+| `imageQuality` | InputNumber | 图片压缩质量（0-100） |
+| `maxPages` | InputNumber | PDF 最大页数限制（0 = 不限制） |
+| `downloadConcurrency` | InputNumber | 下载图片并发数（1-10） |
 
 锅巴面板保存时，会通过全局钩子回写到 `config/jmreader.yaml` 并即时生效。
 

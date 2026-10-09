@@ -67,6 +67,30 @@ export function supportGuoba () {
             placeholder: '默认 82',
           },
         },
+        {
+          field: 'maxPages',
+          label: 'PDF 最大页数限制',
+          helpMessage: '生成 PDF 时允许的最大页数，超过则拒绝并提示改用单章下载。',
+          bottomHelpMessage: '0 表示不限制。建议设一个合理值（如 100），避免整本漫画 PDF 过大、群文件上传失败。',
+          component: 'InputNumber',
+          componentProps: {
+            min: 0,
+            max: 100000,
+            placeholder: '默认 0（不限制）',
+          },
+        },
+        {
+          field: 'downloadConcurrency',
+          label: '下载并发数',
+          helpMessage: '生成 PDF 时同时下载的图片数，越大越快，但过高可能被服务器限速或封禁。',
+          bottomHelpMessage: '范围 1 - 10，默认 4。网络不稳定时建议调低。',
+          component: 'InputNumber',
+          componentProps: {
+            min: 1,
+            max: 10,
+            placeholder: '默认 4',
+          },
+        },
       ],
       getConfigData () {
         // 从插件配置对象读取（由 index.js 注入到全局，见下方 setConfigData 说明）
@@ -76,12 +100,16 @@ export function supportGuoba () {
             pdfPassword: cfg.pdfPassword ?? '',
             pageSize: cfg.pageSize ?? 10,
             imageQuality: cfg.imageQuality ?? 82,
+            maxPages: cfg.maxPages ?? 0,
+            downloadConcurrency: cfg.downloadConcurrency ?? 4,
           }
         }
         return {
           pdfPassword: '',
           pageSize: 10,
           imageQuality: 82,
+          maxPages: 0,
+          downloadConcurrency: 4,
         }
       },
       setConfigData (data, { Result }) {
