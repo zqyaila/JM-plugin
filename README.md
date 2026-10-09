@@ -1,6 +1,6 @@
 # JMReader 插件（TRSS-Yunzai）
 
-把 [JM Reader](https://github.com/)（一个 Kotlin + Jetpack Compose 的漫画阅读器）的核心能力移植到 **TRSS-Yunzai** QQ 机器人上，用 Node.js 复刻了它的完整网络协议（主机发现、请求签名、AES 响应解密、图片打乱还原）。
+把 [JM Reader](https://github.com/](https://github.com/Aether-1013/jm-reader)（一个 Kotlin + Jetpack Compose 的漫画阅读器）的核心能力移植到 **TRSS-Yunzai** QQ 机器人上，用 Node.js 复刻了它的完整网络协议（主机发现、请求签名、AES 响应解密、图片打乱还原）。
 
 > [!IMPORTANT]
 > ## ⚠️ 免责声明（请务必完整阅读）
@@ -48,6 +48,34 @@
 1. 本声明的最终解释权归本项目作者所有，并可能随项目调整而更新。
 2. 如你是相关权利人或版权方，认为本项目侵犯了你的合法权益，请联系我们，我们将积极配合处理。
 3. 本项目代码遵循 [GNU General Public License v3.0](../LICENSE) 开源协议（如另有约定以实际许可证文件为准）。
+
+
+## 安装
+
+在 Yunzai 根目录执行，用 `git clone` 拉取插件：
+
+```bash
+cd Yunzai
+git clone https://github.com/zqyaila/JM-plugin ./plugins/JM-plugin/
+```
+
+
+然后进入插件目录安装依赖（图片打乱还原 + PDF 生成）：
+
+```bash
+cd plugins/JM-plugin
+npm install
+```
+
+重启机器人
+
+### 更新插件
+
+```bash
+cd plugins/JM-plugin
+git pull
+npm install
+```
 
 ## 功能
 
@@ -104,33 +132,6 @@
 | `#jm缓存` | **主人**：查看缓存列表 |
 | `#jm帮助` | 帮助菜单 |
 
-## 安装
-
-在 Yunzai 根目录执行，用 `git clone` 拉取插件：
-
-```bash
-cd Yunzai
-git clone <仓库地址> ./plugins/jmreader-plugin/
-```
-
-> 将 `<仓库地址>` 替换为本项目的实际 Git 地址（GitHub / Gitee 等均可）。
-
-然后进入插件目录安装依赖（图片打乱还原 + PDF 生成）：
-
-```bash
-cd plugins/jmreader-plugin
-npm install
-```
-
-重启机器人，或使用 Yunzai 的热更新（`#更新` 后加载）。
-
-### 更新插件
-
-```bash
-cd plugins/jmreader-plugin
-git pull
-npm install
-```
 
 > 依赖说明：核心协议（签名/加密/解密/主机发现）**只用 Node.js 内置模块**，零第三方依赖。
 > - `sharp` — 图片打乱还原（像素级）与 PDF 页转码，必装才能正确还原打乱的页。
