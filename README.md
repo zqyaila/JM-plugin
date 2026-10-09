@@ -49,6 +49,34 @@
 2. 如你是相关权利人或版权方，认为本项目侵犯了你的合法权益，请联系我们，我们将积极配合处理。
 3. 本项目代码遵循 [GNU General Public License v3.0](../LICENSE) 开源协议（如另有约定以实际许可证文件为准）。
 
+
+## 安装
+
+在 Yunzai 根目录执行，用 `git clone` 拉取插件：
+
+```bash
+cd Yunzai
+git clone https://github.com/zqyaila/JM-plugin ./plugins/jmreader-plugin/
+```
+
+
+然后进入插件目录安装依赖（图片打乱还原 + PDF 生成）：
+
+```bash
+cd plugins/jmreader-plugin
+npm install
+```
+
+重启机器人
+
+### 更新插件
+
+```bash
+cd plugins/jmreader-plugin
+git pull
+npm install
+```
+
 ## 功能
 
 - 🔎 **搜索（可翻页）** — `#jm搜索` 一个框自适应：关键词（标题/作者/标签）走站内搜索，纯数字 / `JM123456` / 链接直接跳转作品；支持页码与「上一页/下一页」翻页
@@ -104,33 +132,6 @@
 | `#jm缓存` | **主人**：查看缓存列表 |
 | `#jm帮助` | 帮助菜单 |
 
-## 安装
-
-在 Yunzai 根目录执行，用 `git clone` 拉取插件：
-
-```bash
-cd Yunzai
-git clone [<仓库地址>](https://github.com/zqyaila/JM-plugin) ./plugins/jmreader-plugin/
-```
-
-> 将 `<仓库地址>` 替换为本项目的实际 Git 地址（GitHub / Gitee 等均可）。
-
-然后进入插件目录安装依赖（图片打乱还原 + PDF 生成）：
-
-```bash
-cd plugins/jmreader-plugin
-npm install
-```
-
-重启机器人，或使用 Yunzai 的热更新（`#更新` 后加载）。
-
-### 更新插件
-
-```bash
-cd plugins/jmreader-plugin
-git pull
-npm install
-```
 
 > 依赖说明：核心协议（签名/加密/解密/主机发现）**只用 Node.js 内置模块**，零第三方依赖。
 > - `sharp` — 图片打乱还原（像素级）与 PDF 页转码，必装才能正确还原打乱的页。
