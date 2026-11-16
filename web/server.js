@@ -10,6 +10,7 @@
  */
 
 import http from 'node:http'
+import crypto from 'node:crypto'
 import path from 'node:path'
 import fs from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
@@ -100,10 +101,56 @@ async function readJsonBody(req, limit = 1024 * 1024) {
   }
 }
 
+// 口令校验：先查是否被锁，再走恒等比较；失败累积到阈值就锁一段时间，
+// 避免公网暴露后被慢慢试出口令。
+const AUTH_MAX_FAIL = 10
+const AUTH_LOCK_MS = 10 * 60 * 1000
+const authFails = new Map() // ip -> { count, until }
+
+function clientIp(req) {
+  if (options.trustProxy) {
+    const fwd = req.headers['x-forwarded-for']
+    const first = Array.isArray(fwd) ? fwd[0] : String(fwd || '').split(',')[0]
+    const real = req.headers['cf-connecting-ip'] || first
+    if (real) return String(real).trim()
+  }
+  return (req.socket.remoteAddress || '').trim()
+}
+
+function tokenEquals(given) {
+  // 先哈希再定长比较，既避免长度泄漏也躲开 timingSafeEqual 的长度限制
+  const a = crypto.createHash('sha256').update(String(given)).digest()
+  const b = crypto.createHash('sha256').update(String(options.token)).digest()
+  return crypto.timingSafeEqual(a, b)
+}
+
+function authLocked(req) {
+  const rec = authFails.get(clientIp(req))
+  return !!(rec?.until && rec.until > Date.now())
+}
+
 function checkToken(req, url) {
   if (!options.token) return true
+  const ip = clientIp(req)
+  const rec = authFails.get(ip)
+  if (rec?.until && rec.until > Date.now()) return false
+  if (rec?.until) authFails.delete(ip)
+
   const given = req.headers['x-token'] || url.searchParams.get('token') || ''
-  return given === options.token
+  if (given && tokenEquals(given)) {
+    authFails.delete(ip)
+    return true
+  }
+
+  const next = authFails.get(ip) || { count: 0, until: 0 }
+  next.count += 1
+  if (next.count >= AUTH_MAX_FAIL) {
+    next.count = 0
+    next.until = Date.now() + AUTH_LOCK_MS
+    console.warn(`[auth] ${ip} 口令连续错误 ${AUTH_MAX_FAIL} 次，已锁定 10 分钟`)
+  }
+  authFails.set(ip, next)
+  return false
 }
 
 /** 校验 JM 号，避免把任意字符串拼进接口。 */
@@ -371,7 +418,10 @@ async function handleProxyTest(req, res) {
 // ---------------------------------------------------------------------------
 
 async function handleApi(req, res, url) {
-  if (!checkToken(req, url)) return sendError(res, 401, '需要访问口令')
+  if (!checkToken(req, url)) {
+    if (authLocked(req)) return sendError(res, 429, '口令错误次数过多，请 10 分钟后再试')
+    return sendError(res, 401, '需要访问口令')
+  }
 
   const p = url.pathname.replace(/^\/api/, '') || '/'
   const method = req.method || 'GET'
@@ -520,6 +570,7 @@ async function main() {
     console.log('  JM Reader Web 已启动')
     console.log(`  ➜  http://${host}:${options.port}`)
     console.log(`  ➜  监听 ${options.host}:${options.port}${options.token ? '（已启用访问口令）' : ''}`)
+    if (options.trustProxy) console.log('  ➜  信任反向代理的 X-Forwarded-For')
     console.log(`  ➜  代理：${client.proxySummary().text}`)
     console.log(`  ➜  数据目录：${path.join(__dirname, '..', 'data')}`)
     console.log('')

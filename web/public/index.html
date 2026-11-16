@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark" />
 <title>JM Reader · PDF 下载器</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff4d6d'/%3E%3Cpath d='M9 8h9a4 4 0 0 1 4 4v12H13a4 4 0 0 0-4 4V8z' fill='%23fff'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/style.css?v=1" />
+<link rel="stylesheet" href="/style.css?v=2" />
 <script>
   try {
     if (localStorage.getItem('jm-gate-accepted') === '1') document.documentElement.classList.add('gate-passed')
@@ -216,8 +216,27 @@
   </footer>
 </div>
 
+<!-- 访问口令：服务端以 --token 启动时才会出现 -->
+<div class="modal-scrim" id="auth-scrim" hidden></div>
+<div class="modal" id="auth" aria-hidden="true" role="dialog" aria-label="需要访问口令">
+  <header class="modal-head">
+    <h3>需要访问口令</h3>
+  </header>
+  <div class="modal-body">
+    <div class="field">
+      <label for="auth-input">访问口令</label>
+      <input id="auth-input" type="password" autocomplete="current-password" placeholder="启动服务时设置的口令" />
+      <p class="field-hint">口令只保存在本机浏览器，每次请求随头部发送。</p>
+    </div>
+    <div class="test-result" id="auth-error"></div>
+  </div>
+  <footer class="modal-foot">
+    <button class="btn primary" id="auth-submit">进入</button>
+  </footer>
+</div>
+
 <div class="toasts" id="toasts"></div>
 
-<script type="module" src="/app.js?v=1"></script>
+<script type="module" src="/app.js?v=2"></script>
 </body>
 </html>

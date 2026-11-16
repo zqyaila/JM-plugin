@@ -48,6 +48,11 @@ const el = {
   setPassword: $('#set-password'),
   testProxy: $('#btn-test-proxy'),
   testResult: $('#test-result'),
+  authScrim: $('#auth-scrim'),
+  auth: $('#auth'),
+  authInput: $('#auth-input'),
+  authSubmit: $('#auth-submit'),
+  authError: $('#auth-error'),
   toasts: $('#toasts'),
   statCache: $('#stat-cache'),
   statJobs: $('#stat-jobs'),
@@ -56,6 +61,7 @@ const el = {
 
 const state = {
   token: localStorage.getItem('jm-token') || '',
+  authOpen: false,
   query: '',
   page: 1,
   totalPages: 1,
@@ -67,6 +73,18 @@ const state = {
   jobs: new Map(),
   seq: 0,
 }
+
+// 支持用 ?token=口令 分享直达链接：取一次即存本地，并把地址栏里的口令抹掉，
+// 避免留在浏览器历史、截图和后续请求的 Referer 里。
+;(() => {
+  const url = new URL(location.href)
+  const fromUrl = url.searchParams.get('token')
+  if (!fromUrl) return
+  state.token = fromUrl
+  localStorage.setItem('jm-token', fromUrl)
+  url.searchParams.delete('token')
+  history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+})()
 
 // ---------------------------------------------------------------------------
 // 基础工具
@@ -98,7 +116,8 @@ async function api(path, { method = 'GET', body } = {}) {
   })
   const data = await res.json().catch(() => ({}))
   if (res.status === 401) {
-    throw new Error('需要访问口令：请在地址后加 ?token=你的口令 再访问')
+    openAuth()
+    throw new Error('需要访问口令')
   }
   if (!res.ok || data.ok === false) throw new Error(data.error || `请求失败（HTTP ${res.status}）`)
   return data
@@ -129,9 +148,70 @@ if (localStorage.getItem(GATE_KEY) !== '1') el.gate.hidden = false
 el.gateOk?.addEventListener('click', () => {
   localStorage.setItem(GATE_KEY, '1')
   el.gate.hidden = true
+  boot()
 })
 el.gateClose?.addEventListener('click', () => {
   location.href = 'about:blank'
+})
+
+// ---------------------------------------------------------------------------
+// 访问口令（服务端以 --token 启动时才会出现）
+// ---------------------------------------------------------------------------
+
+function openAuth() {
+  if (state.authOpen) return
+  state.authOpen = true
+  el.authScrim.hidden = false
+  requestAnimationFrame(() => el.authScrim.classList.add('show'))
+  el.auth.classList.add('open')
+  el.auth.setAttribute('aria-hidden', 'false')
+  setTimeout(() => el.authInput?.focus(), 60)
+}
+
+function closeAuth() {
+  state.authOpen = false
+  el.authScrim.classList.remove('show')
+  el.auth.classList.remove('open')
+  el.auth.setAttribute('aria-hidden', 'true')
+  setTimeout(() => {
+    if (!state.authOpen) el.authScrim.hidden = true
+  }, 220)
+}
+
+async function submitAuth() {
+  const value = el.authInput.value.trim()
+  if (!value) {
+    el.authError.innerHTML = '<div class="bad">请输入口令</div>'
+    return
+  }
+  const prev = state.token
+  el.authSubmit.disabled = true
+  el.authError.innerHTML = ''
+  state.token = value
+  try {
+    await api('/api/config') // 只用于校验口令；loadConfig 内部会吞异常，不能用它判断
+    localStorage.setItem('jm-token', value)
+    closeAuth()
+    toast('口令正确，已保存到本机', 'ok')
+    await loadConfig()
+    await restoreJobs()
+    refreshCacheStat()
+  } catch (err) {
+    state.token = prev
+    // 401 会被 api() 统一成「需要访问口令」，在弹窗里应表述为口令错误；
+    // 429（失败次数过多）等其它错误保留服务端原文，避免误导。
+    const raw = err?.message || ''
+    const msg = !raw || /需要访问口令/.test(raw) ? '口令不正确，请重试' : raw
+    el.authError.innerHTML = `<div class="bad">${esc(msg)}</div>`
+    el.authInput.select()
+  } finally {
+    el.authSubmit.disabled = false
+  }
+}
+
+el.authSubmit?.addEventListener('click', submitAuth)
+el.authInput?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') submitAuth()
 })
 
 // ---------------------------------------------------------------------------
@@ -712,10 +792,21 @@ document.addEventListener('keydown', (e) => {
   }
 })
 
-;(async function init() {
-  await loadConfig()
-  await restoreJobs()
+let booted = false
+
+async function boot() {
+  if (booted) return
+  booted = true
+  try {
+    await loadConfig()
+    await restoreJobs()
+  } catch {
+    // 未带口令或后端暂不可用：口令框由 api() 的 401 分支弹出，这里不打断页面
+  }
   renderEmpty('输入关键词或 JM 号开始', true)
   refreshCacheStat()
   setInterval(refreshCacheStat, 60000)
-})()
+}
+
+// 已确认过 18+ 才立即初始化，否则等确认后再加载，避免口令框被遮罩挡住
+if (el.gate.hidden) boot()

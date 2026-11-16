@@ -101,10 +101,11 @@ npm run web               # 默认 http://127.0.0.1:7788
 ```bash
 node web/server.js --port 8080            # 换端口
 node web/server.js --host 0.0.0.0         # 允许局域网访问（手机/平板可用）
-node web/server.js --token 我的口令        # 公网部署时建议开启访问口令
+node web/server.js --token 我的口令        # 开启访问口令，公网暴露时必须加
+node web/server.js --trust-proxy          # 放在 Nginx/Caddy 后面时加，按真实 IP 限流
 ```
 
-也可以在 `.env` 之外用环境变量：`JM_PORT`、`JM_HOST`、`JM_TOKEN`。
+也可以用环境变量：`JM_PORT`、`JM_HOST`、`JM_TOKEN`、`JM_TRUST_PROXY=1`。
 
 ### 网页版能做什么
 
@@ -118,11 +119,66 @@ node web/server.js --token 我的口令        # 公网部署时建议开启访�
 
 生成的 PDF 存放在 `data/pdfs/`，与 QQ 插件共用同一份缓存。
 
+### 对外开放（公网 / 组网）
+
+默认只监听 `127.0.0.1`，只有本机能访问。要让别人用，三选一。
+
+**1. 直接暴露端口 + 访问口令**（最快，适合临时用）
+
+```bash
+node web/server.js --host 0.0.0.0 --port 7788 --token 你的口令
+```
+
+访问 `http://服务器IP:7788`，页面会先要求输入口令；口令只存在访问者自己的浏览器里，之后不再打扰。
+
+也可以把口令拼进链接直接发给别人：`http://服务器IP:7788/?token=你的口令` —— 页面读到后会立刻把它从地址栏抹掉，不留在浏览历史和截图里。
+
+⚠️ 这种方式是明文 HTTP，口令和下载的 PDF 都可能被链路中间人看到。长期使用走下面两种。
+
+**2. 反向代理 + HTTPS**（推荐）
+
+Caddy，证书自动签：
+
+```
+jm.example.com {
+    reverse_proxy 127.0.0.1:7788
+}
+```
+
+Nginx：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:7788;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_buffering off;        # SSE 进度需要，否则进度会攒到最后一起吐
+    proxy_read_timeout 3600s;   # 大作品生成耗时长
+}
+```
+
+反代后启动时加 `--trust-proxy`，让限流按真实访客 IP 计数，而不是所有请求都算在 `127.0.0.1` 头上：
+
+```bash
+node web/server.js --token 你的口令 --trust-proxy
+```
+
+不加 `--trust-proxy` 时**不会**采信 `X-Forwarded-For`，否则任何人都能伪造 IP 绕过口令限流。
+
+**3. 组网**（不暴露公网，最安全）
+
+装 Tailscale / ZeroTier，把要用的设备拉进同一虚拟局域网，服务照常 `--host 0.0.0.0` 启动，通过虚拟网 IP 访问，例如 `http://100.x.x.x:7788`。公网扫不到端口，也不用改安全组。
+
+**口令防护**：同一 IP 连续输错 10 次锁定 10 分钟（返回 429）；口令比较用哈希后的恒定时间比较，不泄漏长度和时序。
+
+**防火墙**：直接暴露时记得放行端口，如 `ufw allow 7788/tcp`；云服务器还要在控制台的安全组里放行，只开 7788 这一项即可。
+
 ### 部署提示
 
-- 默认只监听 `127.0.0.1`，外网访问请用 Nginx / Caddy 反代，并**务必**加 `--token`。
-- 反代时需要关闭 SSE 缓冲（Nginx：`proxy_buffering off;`，本服务已发送 `X-Accel-Buffering: no`）。
+- 反向代理务必关闭 SSE 缓冲（本服务已发送 `X-Accel-Buffering: no`，Nginx 仍需 `proxy_buffering off;`）。
 - 整本下载会占用较多内存与带宽，`data/` 目录会持续增长，记得定期清理。
+- 服务没有内置多用户体系：拿到口令的人权限相同，都能生成任务、读缓存列表。只分享给可信的人。
 
 ## 网络代理
 

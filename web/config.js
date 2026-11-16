@@ -120,10 +120,13 @@ export function resolveServerOptions(argv = process.argv.slice(2)) {
     const i = argv.indexOf(`--${name}`)
     return i >= 0 ? argv[i + 1] : undefined
   }
+  const flag = (name) => argv.includes(`--${name}`)
   return {
     port: Number(arg('port') || process.env.JM_PORT || process.env.PORT || 7788),
     host: arg('host') || process.env.JM_HOST || '127.0.0.1',
     token: arg('token') || process.env.JM_TOKEN || '',
+    // 只有明确声明反代时才信任 X-Forwarded-For：否则客户端可伪造 IP 绕过口令限流
+    trustProxy: flag('trust-proxy') || process.env.JM_TRUST_PROXY === '1',
   }
 }
 
