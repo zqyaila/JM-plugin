@@ -6,6 +6,7 @@
  */
 
 import JmClient, { needsDescramble, sliceCount } from './jmcore.js'
+import { proxyRequest } from './proxy.js'
 
 /** 图片打乱还原：优先用 sharp，没有则返回原图字节。 */
 let _sharp = null
@@ -26,7 +27,7 @@ async function loadSharp() {
  * @returns {Promise<{ buf: Buffer, ext: string, descrambled: boolean }>}
  */
 export async function fetchPageImage(client, url, aid, scrambleId) {
-  const res = await rawGet(url)
+  const res = await rawGet(client, url)
   if (!res) throw new Error('图片下载失败')
   let buf = res
   const pageName = fileName(url)
@@ -79,12 +80,25 @@ export async function fetchPageImage(client, url, aid, scrambleId) {
   return { buf, ext: 'jpg', descrambled: false }
 }
 
-/** 极简二进制 GET（复用 client 的 httpRequest 逻辑，这里直接内联 fetch）。 */
-async function rawGet(url) {
+/**
+ * 极简二进制 GET。
+ * 图片 CDN 常被墙或限速，因此与 API 请求共用同一套代理配置：
+ * 由 client.rotateProxy('image') 决定是否走代理（proxyMode 为 all / image 时生效）。
+ */
+async function rawGet(client, url) {
+  const proxy = client?.rotateProxy?.('image') ?? null
   try {
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } })
-    if (!res.ok) return null
-    return Buffer.from(await res.arrayBuffer())
+    const res = await proxyRequest(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        Referer: 'https://jmcomic.me/',
+      },
+      timeout: 25000,
+      proxy,
+    })
+    if (res.status >= 400) return null
+    return res.body
   } catch {
     return null
   }

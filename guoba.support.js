@@ -91,6 +91,36 @@ export function supportGuoba () {
             placeholder: '默认 4',
           },
         },
+        {
+          label: '网络代理',
+          component: 'SOFT_GROUP_BEGIN',
+        },
+        {
+          field: 'proxy',
+          label: '代理地址',
+          helpMessage: '支持 http:// https:// socks5:// 三种协议，可填多个（逗号或换行分隔），请求失败时自动轮换到下一个。',
+          bottomHelpMessage: '例：http://127.0.0.1:7890 或 socks5://user:pass@127.0.0.1:1080。留空表示直连。',
+          component: 'InputTextArea',
+          componentProps: {
+            placeholder: 'http://127.0.0.1:7890',
+            rows: 2,
+          },
+        },
+        {
+          field: 'proxyMode',
+          label: '代理生效范围',
+          helpMessage: 'all = 接口与图片都走代理；api = 只有接口请求走代理；image = 只有图片下载走代理。',
+          bottomHelpMessage: '接口与图片 CDN 的可达性常常不同，可按需分开设置。',
+          component: 'Select',
+          componentProps: {
+            options: [
+              { label: '全部流量 (all)', value: 'all' },
+              { label: '仅接口 (api)', value: 'api' },
+              { label: '仅图片 (image)', value: 'image' },
+              { label: '关闭 (off)', value: 'off' },
+            ],
+          },
+        },
       ],
       getConfigData () {
         // 从插件配置对象读取（由 index.js 注入到全局，见下方 setConfigData 说明）
@@ -102,6 +132,8 @@ export function supportGuoba () {
             imageQuality: cfg.imageQuality ?? 82,
             maxPages: cfg.maxPages ?? 0,
             downloadConcurrency: cfg.downloadConcurrency ?? 4,
+            proxy: cfg.proxy ?? '',
+            proxyMode: cfg.proxyMode ?? 'all',
           }
         }
         return {
@@ -110,6 +142,8 @@ export function supportGuoba () {
           imageQuality: 82,
           maxPages: 0,
           downloadConcurrency: 4,
+          proxy: '',
+          proxyMode: 'all',
         }
       },
       setConfigData (data, { Result }) {

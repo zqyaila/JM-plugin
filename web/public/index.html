@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>JM Reader · PDF 下载器</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff4d6d'/%3E%3Cpath d='M9 8h9a4 4 0 0 1 4 4v12H13a4 4 0 0 0-4 4V8z' fill='%23fff'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/style.css?v=1" />
+<script>
+  try {
+    if (localStorage.getItem('jm-gate-accepted') === '1') document.documentElement.classList.add('gate-passed')
+  } catch (e) {}
+</script>
+</head>
+<body>
+
+<!-- 成人内容提示：首次进入需确认 -->
+<div class="gate" id="gate">
+  <div class="gate-card">
+    <div class="gate-badge">18+</div>
+    <h1>JM Reader <span>Web</span></h1>
+    <p class="gate-lead">一个把漫画抓取、图片还原与 PDF 合成搬到浏览器里的本地工具。</p>
+    <ul class="gate-list">
+      <li>本工具不托管、不存储、不传播任何内容，全部图文均来自第三方站点。</li>
+      <li>请确认你已年满 18 周岁，且所在国家或地区法律允许访问此类内容。</li>
+      <li>下载内容仅供个人学习与技术研究，不得传播、复制、售卖或用于任何商业目的。</li>
+      <li>使用产生的一切后果由使用者自行承担。</li>
+    </ul>
+    <button class="btn primary wide" id="gate-ok">我已阅读并同意，进入</button>
+    <button class="btn ghost wide" id="gate-close">离开</button>
+  </div>
+</div>
+
+<header class="topbar">
+  <a class="brand" href="/" aria-label="首页">
+    <span class="brand-mark">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v14H6.5A2.5 2.5 0 0 0 4 19.5V5.5Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H19v4H6.5A2.5 2.5 0 0 1 4 19.5Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+      </svg>
+    </span>
+    <span class="brand-text">JM Reader<em>PDF</em></span>
+  </a>
+
+  <form class="searchbar" id="search-form" role="search">
+    <svg class="searchbar-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.8"/>
+      <path d="m16.5 16.5 4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+    </svg>
+    <input id="q" name="q" type="search" placeholder="搜索作品、作者或标签，也可直接粘贴 JM 号 / 链接" autocomplete="off" spellcheck="false" />
+    <kbd class="hint-key">Enter</kbd>
+  </form>
+
+  <div class="topbar-actions">
+    <button class="icon-btn" id="btn-tasks" title="下载任务" aria-label="下载任务">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M12 3v11m0 0 4-4m-4 4-4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+      <span class="badge-dot" id="task-badge" hidden></span>
+    </button>
+    <button class="icon-btn" id="btn-settings" title="设置" aria-label="设置">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle cx="12" cy="12" r="3.2" stroke="currentColor" stroke-width="1.8"/>
+        <path d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.6 5.6l1.6 1.6M16.8 16.8l1.6 1.6M18.4 5.6l-1.6 1.6M7.2 16.8l-1.6 1.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<main class="main">
+  <section class="hero" id="hero">
+    <div class="hero-copy">
+      <p class="eyebrow">JM READER · WEB EDITION</p>
+      <h1>搜一部作品，<br /><span>拿一份 PDF。</span></h1>
+      <p class="hero-sub">自动抓取章节、还原被打乱的图片、按页合成 PDF，支持 HTTP / SOCKS5 代理下载。</p>
+    </div>
+    <div class="hero-stats" id="hero-stats">
+      <div class="stat"><b id="stat-cache">–</b><span>本地缓存</span></div>
+      <div class="stat"><b id="stat-jobs">–</b><span>进行中</span></div>
+      <div class="stat"><b id="stat-proxy">–</b><span>网络模式</span></div>
+    </div>
+  </section>
+
+  <section class="results-head" id="results-head" hidden>
+    <h2 id="results-title">搜索结果</h2>
+    <span class="results-meta" id="results-meta"></span>
+  </section>
+
+  <section class="grid" id="grid" aria-live="polite"></section>
+
+  <div class="empty" id="empty">
+    <div class="empty-art">
+      <svg viewBox="0 0 120 120" fill="none" aria-hidden="true">
+        <rect x="18" y="14" width="56" height="76" rx="8" stroke="currentColor" stroke-width="2.2" opacity=".5"/>
+        <rect x="42" y="30" width="56" height="76" rx="8" stroke="currentColor" stroke-width="2.2"/>
+        <path d="M56 52h28M56 62h28M56 72h18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".7"/>
+      </svg>
+    </div>
+    <p id="empty-text">输入关键词或 JM 号开始</p>
+    <div class="chips" id="chips">
+      <button class="chip" data-q="热门">试试「热门」</button>
+      <button class="chip" data-q="短篇">试试「短篇」</button>
+    </div>
+
+    <div class="steps">
+      <div class="step">
+        <b>01</b>
+        <h4>搜索</h4>
+        <p>作品名、作者、标签，或直接粘贴 JM 号</p>
+      </div>
+      <div class="step">
+        <b>02</b>
+        <h4>选择</h4>
+        <p>整本或指定章节，按需设置 PDF 密码</p>
+      </div>
+      <div class="step">
+        <b>03</b>
+        <h4>下载</h4>
+        <p>自动抓图、还原打乱页、合成为 PDF</p>
+      </div>
+    </div>
+  </div>
+
+  <nav class="pager" id="pager" hidden>
+    <button class="btn ghost" id="prev-page">上一页</button>
+    <span id="page-info">1 / 1</span>
+    <button class="btn ghost" id="next-page">下一页</button>
+  </nav>
+</main>
+
+<!-- 详情抽屉 -->
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <button class="icon-btn" id="drawer-close" aria-label="关闭">
+      <svg viewBox="0 0 24 24" fill="none"><path d="m6 6 12 12M18 6 6 18" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<!-- 任务面板 -->
+<aside class="tasks" id="tasks" aria-hidden="true">
+  <header class="tasks-head">
+    <h3>下载任务</h3>
+    <button class="icon-btn small" id="tasks-close" aria-label="关闭">
+      <svg viewBox="0 0 24 24" fill="none"><path d="m6 6 12 12M18 6 6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+  </header>
+  <div class="tasks-body" id="tasks-body"></div>
+</aside>
+
+<!-- 设置 -->
+<div class="modal-scrim" id="modal-scrim" hidden></div>
+<div class="modal" id="settings" aria-hidden="true" role="dialog" aria-label="设置">
+  <header class="modal-head">
+    <h3>设置</h3>
+    <button class="icon-btn small" id="settings-close" aria-label="关闭">
+      <svg viewBox="0 0 24 24" fill="none"><path d="m6 6 12 12M18 6 6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+  </header>
+  <div class="modal-body">
+    <div class="field">
+      <label for="set-proxy">代理地址</label>
+      <textarea id="set-proxy" rows="2" placeholder="http://127.0.0.1:7890&#10;socks5://user:pass@127.0.0.1:1080&#10;多个用逗号或换行分隔"></textarea>
+      <p class="field-hint">支持 <code>http://</code> <code>https://</code> <code>socks5://</code>，可填多个，失败自动轮换。</p>
+    </div>
+
+    <div class="field-row">
+      <div class="field">
+        <label for="set-mode">生效范围</label>
+        <select id="set-mode">
+          <option value="all">全部流量</option>
+          <option value="api">仅接口</option>
+          <option value="image">仅图片</option>
+          <option value="off">关闭代理</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="set-concurrency">下载并发</label>
+        <input id="set-concurrency" type="number" min="1" max="10" />
+      </div>
+    </div>
+
+    <div class="field-row">
+      <div class="field">
+        <label for="set-quality">图片质量</label>
+        <input id="set-quality" type="number" min="1" max="100" />
+      </div>
+      <div class="field">
+        <label for="set-maxpages">整本页数上限</label>
+        <input id="set-maxpages" type="number" min="0" max="100000" />
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="set-encrypt">默认 PDF 加密</label>
+      <select id="set-encrypt">
+        <option value="none">不加密，直接打开</option>
+        <option value="id">用 JM 号作为打开密码</option>
+        <option value="custom">固定密码</option>
+      </select>
+      <input id="set-password" type="text" maxlength="32" placeholder="固定密码（仅上一项选择「固定密码」时使用）" />
+    </div>
+
+    <div class="field">
+      <button class="btn ghost" id="btn-test-proxy">测试代理连通性</button>
+      <div class="test-result" id="test-result"></div>
+    </div>
+  </div>
+  <footer class="modal-foot">
+    <button class="btn ghost" id="settings-cancel">取消</button>
+    <button class="btn primary" id="settings-save">保存</button>
+  </footer>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script type="module" src="/app.js?v=1"></script>
+</body>
+</html>

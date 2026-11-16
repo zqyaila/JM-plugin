@@ -16,8 +16,7 @@
  */
 
 import crypto from 'node:crypto'
-import https from 'node:https'
-import http from 'node:http'
+import { proxyRequest, parseProxyList, maskProxy } from './proxy.js'
 
 // ---------------------------------------------------------------------------
 // 常量（与 Kotlin 端 ApiClient.companion / Crypto 一致）
@@ -147,40 +146,20 @@ export function descrambleImage(bytes, aid, pageName, scrambleId, imageUrl) {
 }
 
 // ---------------------------------------------------------------------------
-// 轻量 HTTP 客户端（仅用内置模块）
+// 轻量 HTTP 客户端（仅用内置模块 + 可选代理）
 // ---------------------------------------------------------------------------
 
-function httpRequest(url, { method = 'GET', headers = {}, body = null, timeout = 15000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url)
-    const isHttps = u.protocol === 'https:'
-    const lib = isHttps ? https : http
-    const req = lib.request(
-      u,
-      {
-        method,
-        headers,
-        timeout,
-      },
-      (res) => {
-        const chunks = []
-        res.on('data', (c) => chunks.push(c))
-        res.on('end', () => {
-          const buf = Buffer.concat(chunks)
-          resolve({ status: res.statusCode, headers: res.headers, body: buf })
-        })
-      },
-    )
-    req.on('timeout', () => req.destroy(new Error('timeout')))
-    req.on('error', reject)
-    if (body) req.write(body)
-    req.end()
-  })
+/**
+ * 发请求，返回 { status, headers, body: Buffer }。
+ * proxy 为 null 时直连；传入解析后的代理对象则走 http/https/socks5 隧道。
+ */
+function httpRequest(url, { method = 'GET', headers = {}, body = null, timeout = 15000, proxy = null } = {}) {
+  return proxyRequest(url, { method, headers, body, timeout, proxy })
 }
 
 /** GET 请求，返回 { status, text, buf }。 */
-async function getText(url, headers = {}, timeout = 15000) {
-  const res = await httpRequest(url, { method: 'GET', headers, timeout })
+async function getText(url, headers = {}, timeout = 15000, proxy = null) {
+  const res = await httpRequest(url, { method: 'GET', headers, timeout, proxy })
   return { status: res.status, text: res.body.toString('utf8'), buf: res.body }
 }
 
@@ -197,6 +176,61 @@ export class JmClient {
     this.jwtToken = null    // Authorization: Bearer
     this.avsSession = null  // Cookie: AVS=
     this.member = null      // 登录后保存的会员信息对象
+
+    // 代理：list 为代理对象数组（支持轮换），mode 决定哪些流量走代理
+    this.proxy = { list: [], mode: 'off' }
+    this._proxyIdx = 0
+  }
+
+  // --- 代理配置 ---
+
+  /**
+   * 应用代理配置（可重复调用以热更新）。
+   * @param {{proxy?: string|string[], proxyMode?: 'all'|'api'|'image'|'off'}} cfg
+   */
+  applyProxy({ proxy, proxyMode } = {}) {
+    const list = parseProxyList(proxy)
+    let mode = String(proxyMode || '').toLowerCase()
+    if (!['all', 'api', 'image', 'off'].includes(mode)) mode = list.length ? 'all' : 'off'
+    if (!list.length) mode = 'off'
+    this.proxy = { list, mode }
+    if (this._proxyIdx >= list.length) this._proxyIdx = 0
+    return this.proxy
+  }
+
+  /** 当前是否启用代理。 */
+  get proxyEnabled() {
+    return this.proxy.list.length > 0 && this.proxy.mode !== 'off'
+  }
+
+  /** 该类型流量（api / image）应使用的代理；不需要则返回 null。 */
+  proxyFor(kind) {
+    const { list, mode } = this.proxy
+    if (!list.length || mode === 'off') return null
+    if (mode !== 'all' && mode !== kind) return null
+    return list[this._proxyIdx % list.length]
+  }
+
+  /**
+   * 取一个代理并把轮换指针后移：多代理时每次请求换一个，
+   * 配合重试即可实现「某个代理挂了自动换下一个」。
+   */
+  rotateProxy(kind) {
+    const p = this.proxyFor(kind)
+    const n = this.proxy.list.length
+    if (n > 1) this._proxyIdx = (this._proxyIdx + 1) % n
+    return p
+  }
+
+  /** 代理配置的可读摘要（密码打码，可安全展示在日志/界面）。 */
+  proxySummary() {
+    const { list, mode } = this.proxy
+    if (!list.length) return { enabled: false, mode: 'off', text: '未配置代理（直连）' }
+    return {
+      enabled: mode !== 'off',
+      mode,
+      text: `${mode === 'off' ? '已禁用' : '已启用'}（${mode}）：${list.map(maskProxy).join(', ')}`,
+    }
   }
 
   /** 标准化主机名：去协议、去尾斜杠、需含点号。 */
@@ -213,7 +247,7 @@ export class JmClient {
     for (const u of HOST_URLS) {
       let text = null
       try {
-        text = (await getText(u)).text
+        text = (await getText(u, {}, 15000, this.rotateProxy('api'))).text
       } catch {
         continue
       }
@@ -265,7 +299,7 @@ export class JmClient {
       version: CLIENT_VERSION,
     }
     try {
-      const { text } = await getText(url, headers, 8000)
+      const { text } = await getText(url, headers, 8000, this.rotateProxy('api'))
       let code = -1
       try {
         code = JSON.parse(text).code ?? -1
@@ -382,11 +416,17 @@ export class JmClient {
       headers['Content-Type'] = 'application/x-www-form-urlencoded'
     }
 
-    // 重试 3 次（对应 Kotlin 端重试逻辑）
+    // 重试 3 次（对应 Kotlin 端重试逻辑）；每次重试轮换到下一个代理
     let lastErr = null
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const res = await httpRequest(url, { method, headers, body, timeout: 20000 })
+        const res = await httpRequest(url, {
+          method,
+          headers,
+          body,
+          timeout: 20000,
+          proxy: this.rotateProxy('api'),
+        })
         const text = res.body.toString('utf8')
         return this.parseResponse(text, url, time, res.status)
       } catch (e) {

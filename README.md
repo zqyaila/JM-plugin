@@ -1,6 +1,15 @@
-# JMReader 插件（TRSS-Yunzai）
+# JMReader（TRSS-Yunzai 插件 + Web PDF 下载器）
 
-把 [JM Reader](https://github.com/](https://github.com/Aether-1013/jm-reader)（一个 Kotlin + Jetpack Compose 的漫画阅读器）的核心能力移植到 **TRSS-Yunzai** QQ 机器人上，用 Node.js 复刻了它的完整网络协议（主机发现、请求签名、AES 响应解密、图片打乱还原）。
+把 [JM Reader](https://github.com/Aether-1013/jm-reader)（一个 Kotlin + Jetpack Compose 的漫画阅读器）的核心能力移植到 **TRSS-Yunzai** QQ 机器人上，用 Node.js 复刻了它的完整网络协议（主机发现、请求签名、AES 响应解密、图片打乱还原）。
+
+本仓库现在有**两种用法**，共用同一套核心模块：
+
+| 形态 | 入口 | 适用场景 |
+| --- | --- | --- |
+| QQ 机器人插件 | `index.js` | 在群里发 `#jm1480269` 直接发回加密 PDF |
+| 网页版 | `web/server.js` | 浏览器里搜索、选章节、看进度、下载 PDF，无需机器人环境 |
+
+两者都支持 **HTTP / HTTPS / SOCKS5 代理下载**（可只代理接口、或只代理图片，或多代理轮换）。
 
 > [!IMPORTANT]
 > ## ⚠️ 免责声明（请务必完整阅读）
@@ -77,6 +86,82 @@ git pull
 npm install
 ```
 
+## Web 版（浏览器里下载 PDF）
+
+不需要机器人环境，装好依赖后直接起服务即可（Node.js ≥ 18）：
+
+```bash
+cd plugins/JM-plugin      # 或者单独把整个目录拷到任意位置
+npm install
+npm run web               # 默认 http://127.0.0.1:7788
+```
+
+常用启动参数：
+
+```bash
+node web/server.js --port 8080            # 换端口
+node web/server.js --host 0.0.0.0         # 允许局域网访问（手机/平板可用）
+node web/server.js --token 我的口令        # 公网部署时建议开启访问口令
+```
+
+也可以在 `.env` 之外用环境变量：`JM_PORT`、`JM_HOST`、`JM_TOKEN`。
+
+### 网页版能做什么
+
+- **搜索**：作品名 / 作者 / 标签，或直接粘贴 JM 号（纯数字、`JM123456`、链接都能识别）
+- **详情抽屉**：封面、作者、标签、简介、章节列表、页数
+- **选择范围**：整本，或只下某一章
+- **PDF 加密**：不加密 / 用 JM 号作密码 / 自定义密码
+- **实时进度**：SSE 推送，能看到「正在下载第 37/120 页」，可同时排队多个任务
+- **缓存复用**：同一作品第二次下载直接命中本地缓存，秒出
+- **代理设置**：界面上直接填代理、点一下测试连通性，支持多个代理轮换
+
+生成的 PDF 存放在 `data/pdfs/`，与 QQ 插件共用同一份缓存。
+
+### 部署提示
+
+- 默认只监听 `127.0.0.1`，外网访问请用 Nginx / Caddy 反代，并**务必**加 `--token`。
+- 反代时需要关闭 SSE 缓冲（Nginx：`proxy_buffering off;`，本服务已发送 `X-Accel-Buffering: no`）。
+- 整本下载会占用较多内存与带宽，`data/` 目录会持续增长，记得定期清理。
+
+## 网络代理
+
+核心协议与图片下载原本直连，现在可以整体或部分走代理，用来解决「接口能连、图片 CDN 连不上」或反过来「图片能直连、接口被墙」的情况。
+
+**支持的格式**（零第三方依赖，手写 CONNECT 隧道与 SOCKS5 握手）：
+
+```
+http://127.0.0.1:7890
+https://user:pass@127.0.0.1:8443
+socks5://127.0.0.1:1080
+socks5://user:pass@127.0.0.1:1080
+127.0.0.1:7890                 # 省略协议时按 http 处理
+```
+
+**多个代理**用逗号或换行分隔，请求失败时会自动轮换到下一个：
+
+```
+http://127.0.0.1:7890, socks5://127.0.0.1:1080
+```
+
+**生效范围**（`proxyMode`）：
+
+| 值 | 含义 |
+| --- | --- |
+| `all` | 接口与图片都走代理 |
+| `api` | 只有接口请求走代理，图片直连 |
+| `image` | 只有图片下载走代理，接口直连 |
+| `off` | 关闭代理 |
+
+三种配置方式：
+
+1. **锅巴面板** — 「网络代理」分组里填地址、选范围
+2. **命令** — `#jm代理 <地址>`、`#jm代理 范围 api`、`#jm代理 测试`、`#jm代理 关闭`
+3. **网页版** — 右上角设置里填地址，点「测试代理连通性」看出口 IP 与延迟
+
+> 代理密码会以明文保存在配置文件中（`config/jmreader.yaml` 或 `data/web-config.json`），界面上只显示 `***`。用命令设置时代理串会留在聊天记录里，介意的话请改用配置文件或网页版。
+
+
 ## 功能
 
 - 🔎 **搜索（可翻页）** — `#jm搜索` 一个框自适应：关键词（标题/作者/标签）走站内搜索，纯数字 / `JM123456` / 链接直接跳转作品；支持页码与「上一页/下一页」翻页
@@ -87,6 +172,7 @@ npm install
 - 👤 **会员** — `#jm登录` / `#jm退出` / `#jm收藏` / `#jm历史`
 - 🗑 **资源管理（主人）** — `#jm删除` / `#jm清缓存` / `#jm缓存` 管理缓存 PDF
 - 🖥 **锅巴网页配置** — 通过锅巴面板可视化配置通用密码、每页条数等
+- 🌐 **代理下载** — 支持 HTTP / HTTPS / SOCKS5，可只代理接口或只代理图片，多代理自动轮换
 
 ### PDF 加密说明（双密码）
 
@@ -130,6 +216,10 @@ npm install
 | `#jm删除 <JM号> [章节]` | **主人**：删除单个缓存 PDF |
 | `#jm清缓存` | **主人**：清空全部缓存 |
 | `#jm缓存` | **主人**：查看缓存列表 |
+| `#jm代理 <地址>` | 设置代理（支持 http / https / socks5，多个用逗号分隔） |
+| `#jm代理 范围 api\|image\|all` | 设置代理生效范围 |
+| `#jm代理 测试` | 测试当前代理连通性 |
+| `#jm代理 关闭` | 关闭代理，恢复直连 |
 | `#jm帮助` | 帮助菜单 |
 
 
@@ -143,11 +233,17 @@ npm install
 jmreader-plugin/
 ├─ index.js          插件入口（注册全部命令）
 ├─ guoba.support.js  锅巴网页配置接入
-└─ apps/
-   ├─ jmcore.js      JMComic 协议核心（签名 / AES 解密 / 主机发现 / 打乱算法）
-   ├─ jm.js          数据仓库层（类型化接口 + 图片下载还原 + PDF 生成）
-   ├─ render.js      漫画风信息卡片渲染器（SVG→PNG）
-   └─ store.js       持久化缓存层（data/ 目录 PDF 缓存读写）
+├─ apps/
+│  ├─ jmcore.js      JMComic 协议核心（签名 / AES 解密 / 主机发现 / 打乱算法）
+│  ├─ jm.js          数据仓库层（类型化接口 + 图片下载还原 + PDF 生成）
+│  ├─ proxy.js       代理模块（HTTP CONNECT / SOCKS5 隧道、轮换、连通性测试）
+│  ├─ render.js      漫画风信息卡片渲染器（SVG→PNG）
+│  └─ store.js       持久化缓存层（data/ 目录 PDF 缓存读写）
+└─ web/              Web 版（独立运行，复用 apps/ 全部能力）
+   ├─ server.js      HTTP 服务与 API 路由
+   ├─ jobs.js        PDF 生成任务队列（SSE 推送进度）
+   ├─ config.js      网页版配置读写（data/web-config.json）
+   └─ public/        前端单页（index.html / style.css / app.js）
 ```
 
 ## 实现原理
@@ -172,6 +268,8 @@ pageSize: 10           # 列表每页显示条数（1-20）
 imageQuality: 82       # PDF 内页 JPEG 压缩质量（0-100）
 maxPages: 0            # PDF 最大页数限制（0 = 不限制），超过则拒绝并提示
 downloadConcurrency: 4 # 下载图片并发数（1-10）
+proxy: ''              # 代理地址，如 http://127.0.0.1:7890；多个用逗号分隔；留空=直连
+proxyMode: all         # 代理生效范围：all / api / image / off
 ```
 
 可通过两种方式修改：
@@ -195,6 +293,8 @@ downloadConcurrency: 4 # 下载图片并发数（1-10）
 | `imageQuality` | InputNumber | 图片压缩质量（0-100） |
 | `maxPages` | InputNumber | PDF 最大页数限制（0 = 不限制） |
 | `downloadConcurrency` | InputNumber | 下载图片并发数（1-10） |
+| `proxy` | InputTextArea | 代理地址，可填多个（逗号/换行分隔） |
+| `proxyMode` | Select | 代理生效范围 all / api / image / off |
 
 锅巴面板保存时，会通过全局钩子回写到 `config/jmreader.yaml` 并即时生效。
 
@@ -205,6 +305,9 @@ downloadConcurrency: 4 # 下载图片并发数（1-10）
 - 登录密码会出现在聊天记录里，请仅在私聊/可信环境使用。
 - 整本漫画合成 PDF 会较大，发送大文件时可能受 QQ 群文件大小限制；建议单章下载，或分卷。
 - 缓存不设过期时间（除非主人手动删除），长期使用会占用磁盘；可用 `#jm清缓存` 清理。
+- 代理只作用于本插件/本服务的请求，不改系统代理、不影响机器上其它程序。
+- 网页版任务队列保存在内存中，重启服务后「进行中」的任务会丢失（已生成的 PDF 文件与本地缓存仍在）。
+- 网页版默认单机使用；对公网开放请自行加反向代理与访问口令，并注意 `data/` 目录的访问权限。
 
 ## 协议
 
