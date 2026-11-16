@@ -570,6 +570,10 @@ async function main() {
     console.log('  JM Reader Web 已启动')
     console.log(`  ➜  http://${host}:${options.port}`)
     console.log(`  ➜  监听 ${options.host}:${options.port}${options.token ? '（已启用访问口令）' : ''}`)
+    if (options.host === '0.0.0.0' && !options.token) {
+      console.warn('  ⚠️  已对局域网/公网开放，但没有设置访问口令 —— 拿到地址的人都能用')
+      console.warn('     建议改为：--host 0.0.0.0 --token 你的口令')
+    }
     if (options.trustProxy) console.log('  ➜  信任反向代理的 X-Forwarded-For')
     console.log(`  ➜  代理：${client.proxySummary().text}`)
     console.log(`  ➜  数据目录：${path.join(__dirname, '..', 'data')}`)
