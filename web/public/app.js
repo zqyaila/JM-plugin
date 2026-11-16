@@ -6,6 +6,22 @@
 const $ = (sel, root = document) => root.querySelector(sel)
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)]
 
+const OPEN_GROUPS_KEY = 'jm-open-groups'
+
+/** 记住哪些作品是展开的，刷新后不用重新点。 */
+function loadOpenGroups() {
+  try {
+    const raw = JSON.parse(store.get(OPEN_GROUPS_KEY) || '[]')
+    return new Set(Array.isArray(raw) ? raw.map(String).slice(-40) : [])
+  } catch {
+    return new Set()
+  }
+}
+
+function saveOpenGroups() {
+  store.set(OPEN_GROUPS_KEY, JSON.stringify([...state.openGroups].slice(-40)))
+}
+
 /**
  * localStorage 在「隐私模式 / 禁用站点数据 / 某些内嵌浏览器」下会直接抛异常。
  * 一旦在模块顶层抛了，整个 app.js 就不再执行 —— 页面表现就是骨架出来了、
@@ -109,6 +125,7 @@ const state = {
   jobs: new Map(),
   cacheItems: [],
   cacheSig: '',
+  openGroups: loadOpenGroups(),
   seq: 0,
   slowHint: 0,
 }
@@ -721,6 +738,10 @@ async function startJob() {
 function trackJob(job) {
   const prev = state.jobs.get(job.id) || {}
   state.jobs.set(job.id, { ...prev, ...job })
+  if (job.status === 'queued' || job.status === 'running') {
+    state.openGroups.add(String(job.albumId))
+    saveOpenGroups()
+  }
   renderJobs()
   if (job.status === 'done' || job.status === 'error') return
 
@@ -763,20 +784,11 @@ function updateJob(snapshot) {
 
 function renderJobs() {
   const jobs = [...state.jobs.values()].sort((a, b) => b.createdAt - a.createdAt)
-  const cacheItems = (state.cacheItems || []).slice(0, 20)
-  const html = []
+  const cacheItems = (state.cacheItems || []).slice(0, 60)
+  const groups = buildGroups(jobs, cacheItems)
 
-  if (jobs.length) {
-    html.push('<div class="job-sec">下载任务</div>')
-    html.push(jobs.map(renderJob).join(''))
-  }
-  if (cacheItems.length) {
-    html.push('<div class="job-sec">本地缓存 · 可直接下载</div>')
-    html.push(cacheItems.map(renderCacheItem).join(''))
-  }
-
-  el.tasksBody.innerHTML = html.length
-    ? html.join('')
+  el.tasksBody.innerHTML = groups.length
+    ? groups.map(renderGroup).join('')
     : `<div class="empty" style="padding:34px 18px"><p>还没有任务</p></div>`
 
   const active = jobs.some((j) => j.status === 'queued' || j.status === 'running')
@@ -784,11 +796,136 @@ function renderJobs() {
   updateStats()
 }
 
-/** 任务标题后缀：第几章 / 第几到第几章。 */
-function rangeSuffix(j) {
-  if (j.whole || (j.from == null && j.to == null)) return ''
-  if (j.from === j.to) return ` · 第${j.from}章`
-  return ` · 第${j.from}-${j.to}章`
+/** 任务对应的缓存键，用来和缓存列表去重（同一个 PDF 不重复显示两次）。 */
+function jobCacheKey(j) {
+  if (j.kind && j.kind !== 'pdf') return null
+  if (j.whole || (j.from == null && j.to == null)) return String(j.albumId)
+  if (j.from === j.to) return `${j.albumId}_c${j.from}`
+  return `${j.albumId}_r${j.from ?? 1}-${j.to ?? 'end'}`
+}
+
+/** 组内条目排序：按起始章节号，整本排最后。 */
+function entryOrder(e) {
+  if (e.job) {
+    if (e.job.whole || e.job.from == null) return 1e9
+    return Number(e.job.from) || 0
+  }
+  const it = e.cache
+  if (it.chapter != null) return Number(it.chapter) || 0
+  const m = /^r(\d+)-(?:\d+|end)$/.exec(it.tag || '')
+  if (m) return Number(m[1])
+  return 1e9
+}
+
+const pickTitle = (a, b) => (!a || /^JM\d+$/.test(a) ? b : a)
+
+/** 旧缓存里的名字可能是「作品名 第2話」，作为组标题时去掉章节后缀。 */
+function stripChapterSuffix(title) {
+  const out = String(title || '').replace(/\s*第\s*[0-9一二三四五六七八九十百]+\s*[話话章卷回节節]\s*$/, '').trim()
+  return out || title
+}
+
+/** 按作品（JM 号）把任务和缓存归到同一组。 */
+function buildGroups(jobs, cacheItems) {
+  const map = new Map()
+  const get = (id, title) => {
+    const key = String(id)
+    let g = map.get(key)
+    if (!g) {
+      g = { albumId: key, title: '', jobs: [], cache: [], time: 0 }
+      map.set(key, g)
+    }
+    if (title) g.title = pickTitle(g.title, title)
+    return g
+  }
+
+  for (const j of jobs) {
+    const g = get(j.albumId, j.title)
+    g.jobs.push(j)
+    g.time = Math.max(g.time, j.finishedAt || j.createdAt || 0)
+  }
+
+  // 已由任务覆盖的缓存不再单列，否则同一个 PDF 会出现两遍
+  const jobKeys = new Set(jobs.map(jobCacheKey).filter(Boolean))
+  for (const it of cacheItems) {
+    if (jobKeys.has(it.key)) continue
+    const g = get(it.id, it.name)
+    g.cache.push(it)
+    g.time = Math.max(g.time, it.time || 0)
+  }
+
+  return [...map.values()]
+    .map((g) => {
+      g.entries = [
+        ...g.jobs.map((job) => ({ job })),
+        ...g.cache.map((cache) => ({ cache })),
+      ].sort((a, b) => entryOrder(a) - entryOrder(b))
+      if (g.entries.length > 1) g.title = stripChapterSuffix(g.title)
+      g.active = g.jobs.filter((j) => j.status === 'queued' || j.status === 'running')
+      g.failed = g.jobs.filter((j) => j.status === 'error')
+      g.size = g.entries.reduce((sum, e) => sum + (e.job?.size || e.cache?.size || 0), 0)
+      return g
+    })
+    .sort((a, b) => b.time - a.time)
+}
+
+/** 组内条目的章节标签。 */
+function chapterLabel(e) {
+  if (e.job) {
+    const j = e.job
+    if (j.whole || (j.from == null && j.to == null)) return '整本'
+    if (j.from === j.to) return `第 ${j.from} 章`
+    return `第 ${j.from}-${j.to} 章`
+  }
+  const it = e.cache
+  if (it.chapter != null) return `第 ${it.chapter} 章`
+  const m = /^r(\d+)-(\d+|end)$/.exec(it.tag || '')
+  if (m) return `第 ${m[1]}-${m[2] === 'end' ? '末' : m[2]} 章`
+  return '整本'
+}
+
+function renderGroup(g) {
+  const open = state.openGroups.has(g.albumId)
+  const count = g.entries.length
+
+  let cls = 'ok'
+  let stateText = '已完成'
+  let percent = 0
+  let indeterminate = false
+
+  if (g.active.length) {
+    cls = 'run'
+    stateText = `${g.active.length} 进行中`
+    const cur = g.active[0]
+    percent = cur.percent || 0
+    indeterminate = cur.status === 'queued' || !cur.total
+  } else if (g.failed.length) {
+    cls = 'err'
+    stateText = `${g.failed.length} 个失败`
+  }
+
+  const meta = [`JM${g.albumId}`, `${count} 个文件`, g.size ? fmtSize(g.size) : '']
+    .filter(Boolean)
+    .join(' · ')
+
+  const body = open
+    ? `<div class="group-body">${g.entries
+        .map((e) => (e.job ? renderJob(e.job) : renderCacheItem(e.cache)))
+        .join('')}</div>`
+    : ''
+
+  return `<div class="group${open ? ' open' : ''}" data-album="${esc(g.albumId)}">
+    <button class="group-head" type="button">
+      <span class="group-arrow" aria-hidden="true">›</span>
+      <span class="group-main">
+        <span class="group-name" title="${esc(g.title)}">${esc(g.title)}</span>
+        <span class="group-sub">${esc(meta)}</span>
+      </span>
+      <span class="group-state ${cls}">${esc(stateText)}</span>
+    </button>
+    ${g.active.length && !open ? `<div class="group-bar${indeterminate ? ' indeterminate' : ''}"><i style="width:${percent}%"></i></div>` : ''}
+    ${body}
+  </div>`
 }
 
 function renderJob(j) {
@@ -818,10 +955,12 @@ function renderJob(j) {
 
   return `<div class="job" data-id="${j.id}">
     <div class="job-top">
-      <div class="job-name" title="${esc(j.title)}">${esc(j.title)}${rangeSuffix(j)}</div>
+      <div class="job-name" title="${esc(j.title)}">${esc(chapterLabel({ job: j }))}${
+        j.kind === 'zip' ? '<span class="job-tag">ZIP</span>' : ''
+      }</div>
       <div class="job-state ${cls}">${label}</div>
     </div>
-    <div class="bar ${indeterminate ? 'indeterminate' : ''}"><i style="width:${percent}%"></i></div>
+    ${j.status === 'done' ? '' : `<div class="bar ${indeterminate ? 'indeterminate' : ''}"><i style="width:${percent}%"></i></div>`}
     <div class="job-sub">${sub}</div>
     ${action ? `<div class="job-actions">${action}</div>` : ''}
   </div>`
@@ -832,11 +971,9 @@ function renderCacheItem(it) {
   const href = `/api/cache/${encodeURIComponent(it.key)}/download${state.token ? `?token=${encodeURIComponent(state.token)}` : ''}`
   const day = it.time ? new Date(it.time).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) : ''
   const sub = [it.pageCount ? `${it.pageCount} 页` : '', fmtSize(it.size), day].filter(Boolean).join(' · ')
-  const rtag = /^r(\d+)-(\d+|end)$/.exec(it.tag || '')
-  const rangeText = rtag ? ` · 第${rtag[1]}-${rtag[2] === 'end' ? '末' : rtag[2]}章` : ''
   return `<div class="job">
     <div class="job-top">
-      <div class="job-name" title="${esc(it.name)}">${esc(it.name)}${it.chapter != null ? ` · 第${it.chapter}章` : rangeText}</div>
+      <div class="job-name" title="${esc(it.name)}">${esc(chapterLabel({ cache: it }))}</div>
       <div class="job-state ok">已生成</div>
     </div>
     <div class="job-sub">${sub}</div>
@@ -861,6 +998,19 @@ function closeTasks() {
 
 el.btnTasks.addEventListener('click', () => (el.tasks.classList.contains('open') ? closeTasks() : openTasks()))
 el.tasksClose.addEventListener('click', closeTasks)
+
+// 点作品行展开 / 收起该作品的章节列表
+el.tasksBody.addEventListener('click', (e) => {
+  const head = e.target.closest('.group-head')
+  if (!head) return
+  const group = head.closest('.group')
+  const id = group?.dataset.album
+  if (!id) return
+  if (state.openGroups.has(id)) state.openGroups.delete(id)
+  else state.openGroups.add(id)
+  saveOpenGroups()
+  renderJobs()
+})
 
 // 刷新后恢复任务列表
 function applyJobs(list) {
