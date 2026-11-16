@@ -107,6 +107,25 @@ const el = {
   statJobs: $('#stat-jobs'),
   statProxy: $('#stat-proxy'),
   heroStats: $('#hero-stats'),
+  reader: $('#reader'),
+  readerBack: $('#reader-back'),
+  readerTitle: $('#reader-title'),
+  readerSub: $('#reader-sub'),
+  readerChapter: $('#reader-chapter'),
+  readerWidth: $('#reader-width'),
+  readerFull: $('#reader-full'),
+  readerStage: $('#reader-stage'),
+  readerScroll: $('#reader-scroll'),
+  readerPages: $('#reader-pages'),
+  readerEnd: $('#reader-end'),
+  readerState: $('#reader-state'),
+  readerStateText: $('#reader-state-text'),
+  readerRetry: $('#reader-retry'),
+  readerPrevCh: $('#reader-prev-ch'),
+  readerNextCh: $('#reader-next-ch'),
+  readerPos: $('#reader-pos'),
+  readerProgress: $('#reader-progress'),
+  readerTip: $('#reader-tip'),
 }
 
 const state = {
@@ -128,6 +147,19 @@ const state = {
   openGroups: loadOpenGroups(),
   seq: 0,
   slowHint: 0,
+  reader: {
+    open: false,
+    albumId: '',
+    sort: null,
+    chapters: [],
+    pages: [],
+    current: 1,
+    pushed: false,
+    observer: null,
+    posObserver: null,
+    token: 0,
+    saveTimer: null,
+  },
 }
 
 // 支持用 ?token=口令 分享直达链接：取一次即存本地，并把地址栏里的口令抹掉，
@@ -556,6 +588,7 @@ function renderDetail(album) {
 
     <div class="drawer-foot">
       <div class="summary" id="job-summary">整本</div>
+      <button class="btn ghost" id="btn-read">在线阅读</button>
       <button class="btn primary" id="btn-build">开始生成</button>
     </div>`
 
@@ -614,6 +647,19 @@ function renderDetail(album) {
   }
 
   $('#btn-build', el.drawerBody).addEventListener('click', startJob)
+
+  // 在线阅读：有历史记录就从上次那一章接着看
+  const readBtn = $('#btn-read', el.drawerBody)
+  const prog = readProgressOf(album.id)
+  const resume = prog && album.series.some((s) => Number(s.sort) === Number(prog.sort))
+  if (resume) {
+    readBtn.textContent = '继续阅读'
+    readBtn.title = `上次读到第 ${prog.sort} 章`
+  }
+  readBtn.addEventListener('click', () => {
+    openReader(album.id, resume ? prog.sort : state.from)
+  })
+
   updateSummary()
 }
 
@@ -954,10 +1000,18 @@ function renderJob(j) {
           : `${j.total || j.done || 0} 页 · ${fmtSize(j.size)}${j.cached ? ' · 缓存' : ''}`
         : esc(j.message || '')
 
-  const action =
-    j.status === 'done'
-      ? `<a class="btn primary" href="/api/jobs/${j.id}/download${state.token ? `?token=${encodeURIComponent(state.token)}` : ''}">下载 ${j.kind === 'zip' ? 'ZIP' : 'PDF'}</a>`
-      : ''
+  const actions = []
+  if (j.status === 'done') {
+    actions.push(
+      `<a class="btn primary" href="/api/jobs/${j.id}/download${state.token ? `?token=${encodeURIComponent(state.token)}` : ''}">下载 ${j.kind === 'zip' ? 'ZIP' : 'PDF'}</a>`,
+    )
+    // 只有「单章 PDF」能对应到具体章节去在线看；整本 / 区间 / ZIP 没有唯一章节
+    if (j.kind !== 'zip' && j.from != null && j.from === j.to) {
+      actions.push(
+        `<button class="btn ghost" data-read="${esc(j.albumId)}" data-chapter="${j.from}">在线阅读</button>`,
+      )
+    }
+  }
 
   return `<div class="job" data-id="${j.id}">
     <div class="job-top">
@@ -968,7 +1022,7 @@ function renderJob(j) {
     </div>
     ${j.status === 'done' ? '' : `<div class="bar ${indeterminate ? 'indeterminate' : ''}"><i style="width:${percent}%"></i></div>`}
     <div class="job-sub">${sub}</div>
-    ${action ? `<div class="job-actions">${action}</div>` : ''}
+    ${actions.length ? `<div class="job-actions">${actions.join('')}</div>` : ''}
   </div>`
 }
 
@@ -977,13 +1031,17 @@ function renderCacheItem(it) {
   const href = `/api/cache/${encodeURIComponent(it.key)}/download${state.token ? `?token=${encodeURIComponent(state.token)}` : ''}`
   const day = it.time ? new Date(it.time).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) : ''
   const sub = [it.pageCount ? `${it.pageCount} 页` : '', fmtSize(it.size), day].filter(Boolean).join(' · ')
+  const read =
+    it.chapter != null
+      ? `<button class="btn ghost" data-read="${esc(it.id)}" data-chapter="${it.chapter}">在线阅读</button>`
+      : ''
   return `<div class="job">
     <div class="job-top">
       <div class="job-name" title="${esc(it.name)}">${esc(chapterLabel({ cache: it }))}</div>
       <div class="job-state ok">已生成</div>
     </div>
     <div class="job-sub">${sub}</div>
-    <div class="job-actions"><a class="btn primary" href="${href}">下载 PDF</a></div>
+    <div class="job-actions"><a class="btn primary" href="${href}">下载 PDF</a>${read}</div>
   </div>`
 }
 
@@ -1007,6 +1065,11 @@ el.tasksClose.addEventListener('click', closeTasks)
 
 // 点作品行展开 / 收起该作品的章节列表
 el.tasksBody.addEventListener('click', (e) => {
+  const readBtn = e.target.closest('[data-read]')
+  if (readBtn) {
+    openReader(readBtn.dataset.read, Number(readBtn.dataset.chapter))
+    return
+  }
   const head = e.target.closest('.group-head')
   if (!head) return
   const group = head.closest('.group')
@@ -1026,6 +1089,444 @@ function applyJobs(list) {
   }
   renderJobs()
 }
+
+// ---------------------------------------------------------------------------
+// 在线阅读器
+//
+// 竖排连续滚动（条漫 / 页漫都适用）：页面容器先按 2:3 占位，图片到位后
+// 用真实宽高覆盖，避免「图片一张张加载、滚动条不停乱跳」。
+// 只有进入视口前后各 1400px 的页才会真正发请求，30 页的章节也只先拉 3~4 张。
+// ---------------------------------------------------------------------------
+
+const READ_PROGRESS_KEY = 'jm-read-progress'
+const READ_WIDTH_KEY = 'jm-reader-width'
+const WIDTH_MODES = ['fit', 'wide', 'full']
+const WIDTH_LABEL = { fit: '适宽', wide: '宽屏', full: '全宽' }
+
+function loadProgressMap() {
+  try {
+    const raw = JSON.parse(store.get(READ_PROGRESS_KEY) || '{}')
+    return raw && typeof raw === 'object' ? raw : {}
+  } catch {
+    return {}
+  }
+}
+
+function readProgressOf(albumId) {
+  const rec = loadProgressMap()[String(albumId)]
+  return rec && typeof rec === 'object' ? rec : null
+}
+
+function saveReadProgress(albumId, patch) {
+  if (!albumId) return
+  const all = loadProgressMap()
+  all[String(albumId)] = { ...(all[String(albumId)] || {}), ...patch, time: Date.now() }
+  // 只留最近 80 部，别让 localStorage 无限长
+  const keys = Object.keys(all).sort((a, b) => (all[b].time || 0) - (all[a].time || 0))
+  for (const k of keys.slice(80)) delete all[k]
+  store.set(READ_PROGRESS_KEY, JSON.stringify(all))
+}
+
+/** 给图片地址补口令；服务端有时已经带过，别重复拼。 */
+function withToken(url) {
+  if (!state.token || /[?&]token=/.test(url)) return url
+  return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(state.token)}`
+}
+
+const readerHash = (albumId, sort) => `#/read/${albumId}/${sort}`
+
+function showReader() {
+  el.reader.classList.add('open')
+  el.reader.setAttribute('aria-hidden', 'false')
+  document.body.classList.add('reading')
+}
+
+function hideReader() {
+  el.reader.classList.remove('open')
+  el.reader.setAttribute('aria-hidden', 'true')
+  document.body.classList.remove('reading')
+}
+
+function setReaderState(text, { spinner = true, retry = false } = {}) {
+  el.readerStage.classList.add('loading')
+  el.readerStateText.textContent = text
+  el.readerState.querySelector('.reader-spinner').hidden = !spinner
+  el.readerRetry.hidden = !retry
+  el.readerRetry.onclick = retry ? () => loadReaderChapter(state.reader.sort) : null
+}
+
+function clearReaderState() {
+  el.readerStage.classList.remove('loading')
+  el.readerRetry.hidden = true
+}
+
+function applyReaderWidth(mode) {
+  const m = WIDTH_MODES.includes(mode) ? mode : 'fit'
+  el.readerStage.dataset.width = m
+  store.set(READ_WIDTH_KEY, m)
+}
+
+function readerTip(text) {
+  el.readerTip.textContent = text
+  el.readerTip.classList.add('show')
+  clearTimeout(readerTip.timer)
+  readerTip.timer = setTimeout(() => el.readerTip.classList.remove('show'), 2600)
+}
+
+/** 打开阅读器：同一部作品重复调用只会切章。 */
+async function openReader(albumId, sort, { fromHistory = false } = {}) {
+  const id = String(albumId || '').replace(/\D/g, '')
+  if (!id) return
+  const start = Number(sort) || 1
+
+  closeDrawer()
+  closeTasks()
+
+  const wasOpen = state.reader.open
+  state.reader.open = true
+  state.reader.albumId = id
+  showReader()
+  applyReaderWidth(store.get(READ_WIDTH_KEY) || 'fit')
+
+  if (!wasOpen) {
+    if (fromHistory) {
+      state.reader.pushed = false
+    } else if (location.hash.startsWith('#/read/')) {
+      // 已经在一个阅读地址上（分享链接 / 从别的作品跳过来）：
+      // 直接替换，别再加一条历史记录，否则关不掉、返回还会绕回阅读器
+      state.reader.pushed = false
+      try {
+        history.replaceState({ jmReader: 1 }, '', readerHash(id, start))
+      } catch {
+        /* 忽略 */
+      }
+    } else {
+      state.reader.pushed = true
+      try {
+        history.pushState({ jmReader: 1 }, '', readerHash(id, start))
+      } catch {
+        /* 某些内嵌浏览器不允许，忽略即可 */
+      }
+    }
+    readerTip('滚动阅读 · ← → 切换章节 · Esc 退出')
+  }
+
+  await loadReaderChapter(start)
+
+  if (!wasOpen) el.readerScroll.focus?.()
+}
+
+async function loadReaderChapter(sort) {
+  const r = state.reader
+  const albumId = r.albumId
+  const want = Number(sort) || 1
+  const token = ++r.token
+
+  setReaderState('正在加载章节…')
+  r.observer?.disconnect()
+  r.posObserver?.disconnect()
+  el.readerPages.innerHTML = ''
+  el.readerEnd.hidden = true
+  el.readerEnd.innerHTML = ''
+
+  try {
+    const data = await api(
+      `/api/read?id=${encodeURIComponent(albumId)}&chapter=${encodeURIComponent(want)}`,
+      { timeout: 45000 },
+    )
+    if (token !== r.token) return
+
+    r.chapters = data.chapters || []
+    r.sort = data.chapter.sort
+    r.pages = (data.pages || []).map((p) => ({ ...p, state: '' }))
+    r.current = 1
+    r.loaded = 0
+
+    renderReaderHeader(data)
+
+    // 章节切换不新增历史记录，否则连看十话要按十次返回到列表
+    try {
+      history.replaceState({ jmReader: 1 }, '', readerHash(albumId, r.sort))
+    } catch {
+      /* 同上 */
+    }
+
+    renderReaderPages()
+    clearReaderState()
+    el.readerScroll.scrollTop = 0
+    updateReaderProgress()
+
+    const prog = readProgressOf(albumId)
+    // 同一章才恢复页码；换章当然从头看
+    const resumePage =
+      prog && Number(prog.sort) === Number(r.sort) ? Math.max(1, Number(prog.page) || 1) : 1
+    if (resumePage > 1) {
+      const box = el.readerPages.children[resumePage - 1]
+      if (box) {
+        // 等占位高度生效再跳，否则会跳到错误位置
+        requestAnimationFrame(() => {
+          el.readerScroll.scrollTop = box.offsetTop - 8
+          updateReaderProgress()
+        })
+      }
+    }
+
+    saveReadProgress(albumId, { sort: r.sort, page: resumePage })
+  } catch (err) {
+    if (token !== r.token) return
+    setReaderState(err.message || '章节加载失败', { spinner: false, retry: true })
+  }
+}
+
+function renderReaderHeader(data) {
+  const c = data.chapter
+  el.readerTitle.textContent = data.album.name || `JM${data.album.id}`
+  el.readerSub.textContent = `第 ${c.sort} 章 · ${c.name} · ${c.pageCount} 页`
+
+  const narrow = window.matchMedia('(max-width: 640px)').matches
+  el.readerChapter.innerHTML = (data.chapters || [])
+    .map(
+      (s) =>
+        `<option value="${s.sort}">${narrow ? `第${s.sort}章` : `第${s.sort}章 · ${esc(s.name)}`}</option>`,
+    )
+    .join('')
+  el.readerChapter.value = String(c.sort)
+
+  const idx = state.reader.chapters.findIndex((s) => Number(s.sort) === Number(c.sort))
+  const prev = idx > 0 ? state.reader.chapters[idx - 1] : null
+  const next = idx >= 0 && idx < state.reader.chapters.length - 1 ? state.reader.chapters[idx + 1] : null
+
+  el.readerPrevCh.disabled = !prev
+  el.readerNextCh.disabled = !next
+  el.readerPrevCh.title = prev ? `第 ${prev.sort} 章 · ${prev.name}` : '已经是第一章'
+  el.readerNextCh.title = next ? `第 ${next.sort} 章 · ${next.name}` : '已经是最后一章'
+
+  el.readerEnd.hidden = false
+  el.readerEnd.innerHTML = `
+    <p>第 ${c.sort} 章 · ${esc(c.name)} · 已读完</p>
+    ${
+      next
+        ? `<button class="btn primary" data-next="${next.sort}">继续阅读 第 ${next.sort} 章</button>`
+        : '<p style="opacity:.6">已经是最后一章了</p>'
+    }
+    <button class="btn ghost" data-top="1">回到开头</button>`
+  el.readerEnd.querySelector('[data-next]')?.addEventListener('click', (e) => {
+    loadReaderChapter(Number(e.currentTarget.dataset.next))
+  })
+  el.readerEnd.querySelector('[data-top]')?.addEventListener('click', () => {
+    el.readerScroll.scrollTo({ top: 0, behavior: 'smooth' })
+  })
+}
+
+function renderReaderPages() {
+  const r = state.reader
+  const frag = document.createDocumentFragment()
+  r.pages.forEach((p, i) => {
+    const box = document.createElement('div')
+    box.className = 'rpage'
+    box.dataset.i = String(i)
+    // 服务端预量过的页直接按真实比例占位，图片到位前后版面一致，不会跳
+    if (p.w && p.h) box.style.aspectRatio = `${p.w} / ${p.h}`
+    frag.appendChild(box)
+  })
+  el.readerPages.appendChild(frag)
+
+  // 预加载：视口上下各 1400px 内的页
+  r.observer = new IntersectionObserver(
+    (entries) => {
+      for (const en of entries) {
+        if (en.isIntersecting) loadReaderPage(Number(en.target.dataset.i))
+      }
+    },
+    { root: el.readerScroll, rootMargin: '1400px 0px' },
+  )
+  // 当前页：只认穿过视口中线附近的那一页
+  r.posObserver = new IntersectionObserver(
+    (entries) => {
+      for (const en of entries) {
+        if (!en.isIntersecting) continue
+        const n = Number(en.target.dataset.i) + 1
+        if (n !== r.current) {
+          r.current = n
+          updateReaderProgress()
+          scheduleProgressSave()
+        }
+      }
+    },
+    { root: el.readerScroll, rootMargin: '-42% 0px -52% 0px' },
+  )
+
+  for (const node of el.readerPages.children) {
+    r.observer.observe(node)
+    r.posObserver.observe(node)
+  }
+}
+
+function loadReaderPage(i) {
+  const r = state.reader
+  const pg = r.pages[i]
+  const box = el.readerPages.children[i]
+  if (!pg || !box) return
+  if (pg.state === 'ok' || pg.state === 'loading') return
+  pg.state = 'loading'
+  box.classList.remove('failed')
+  box.innerHTML = ''
+
+  const img = document.createElement('img')
+  img.alt = `第 ${i + 1} 页`
+  img.decoding = 'async'
+  if (i > 2) img.loading = 'lazy'
+
+  let retried = false
+  const fail = (msg) => {
+    pg.state = 'error'
+    box.classList.add('failed')
+    box.innerHTML = `<div class="rpage-fail"><span>第 ${i + 1} 页加载失败${msg ? `<br/>${esc(msg)}` : ''}</span><button type="button">重试</button></div>`
+    box.querySelector('button')?.addEventListener('click', () => {
+      pg.state = ''
+      loadReaderPage(i)
+    })
+  }
+
+  img.addEventListener('load', () => {
+    if (!img.naturalWidth) return fail('')
+    pg.state = 'ok'
+    box.classList.add('loaded')
+    // 用真实宽高固定版面，后面的图加载完也不会把已读内容顶走
+    box.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`
+    r.loaded++
+    updateReaderProgress()
+  })
+  img.addEventListener('error', () => {
+    if (!retried) {
+      retried = true
+      setTimeout(() => {
+        img.src = `${withToken(pg.src)}&r=${Date.now()}`
+      }, 700)
+      return
+    }
+    fail('')
+  })
+
+  const url = withToken(pg.src)
+  img.src = url
+  box.appendChild(img)
+}
+
+function updateReaderProgress() {
+  const r = state.reader
+  const sc = el.readerScroll
+  const total = r.pages.length || 1
+  const max = sc.scrollHeight - sc.clientHeight
+  const pct = max > 0 ? Math.min(100, Math.max(0, (sc.scrollTop / max) * 100)) : 0
+  el.readerProgress.style.width = `${pct}%`
+  el.readerPos.textContent = `${r.current} / ${total}`
+}
+
+function scheduleProgressSave() {
+  const r = state.reader
+  clearTimeout(r.saveTimer)
+  r.saveTimer = setTimeout(() => {
+    if (!r.open) return
+    saveReadProgress(r.albumId, { sort: r.sort, page: r.current })
+  }, 700)
+}
+
+function readerStep(dir) {
+  const r = state.reader
+  const idx = r.chapters.findIndex((s) => Number(s.sort) === Number(r.sort))
+  if (idx < 0) return
+  const target = r.chapters[idx + dir]
+  if (!target) {
+    readerTip(dir > 0 ? '已经是最后一章' : '已经是第一章')
+    return
+  }
+  loadReaderChapter(Number(target.sort))
+}
+
+/** 收拾阅读器界面，不碰历史记录（历史由 closeReader / popstate 各自处理）。 */
+function teardownReader() {
+  const r = state.reader
+  if (!r.open) return
+  // 让还在路上的章节请求作废：否则关掉阅读器后响应回来，又往隐藏的容器里塞一堆图片
+  r.token++
+  if (r.sort != null) saveReadProgress(r.albumId, { sort: r.sort, page: r.current })
+  r.open = false
+  r.observer?.disconnect()
+  r.posObserver?.disconnect()
+  clearTimeout(r.saveTimer)
+  hideReader()
+  el.readerPages.innerHTML = ''
+  el.readerEnd.hidden = true
+  if (document.fullscreenElement === el.reader) document.exitFullscreen?.().catch(() => {})
+}
+
+function closeReader() {
+  const r = state.reader
+  if (!r.open) return
+  const pushed = r.pushed
+  r.pushed = false
+  teardownReader()
+
+  const onReaderHash = location.hash.startsWith('#/read/')
+  if (pushed && onReaderHash) {
+    history.back()
+  } else if (onReaderHash) {
+    history.replaceState(null, '', `${location.pathname}${location.search}`)
+  }
+}
+
+/** 从地址栏 #/read/<albumId>/<sort> 恢复阅读（刷新、分享链接）。 */
+function openReaderFromHash({ fromHistory = false } = {}) {
+  const m = /^#\/read\/(\d+)(?:\/(\d+))?$/.exec(location.hash)
+  if (!m || state.reader.open) return false
+  openReader(m[1], m[2] ? Number(m[2]) : 1, { fromHistory })
+  return true
+}
+
+// 浏览器前进 / 后退：回到列表就关阅读器，回到 #/read/... 就重新打开
+window.addEventListener('popstate', () => {
+  if (state.reader.open) {
+    state.reader.pushed = false
+    teardownReader()
+  }
+  openReaderFromHash({ fromHistory: true })
+})
+
+el.readerBack.addEventListener('click', closeReader)
+el.readerChapter.addEventListener('change', () => loadReaderChapter(Number(el.readerChapter.value)))
+el.readerPrevCh.addEventListener('click', () => readerStep(-1))
+el.readerNextCh.addEventListener('click', () => readerStep(1))
+
+el.readerWidth.addEventListener('click', () => {
+  const cur = el.readerStage.dataset.width || 'fit'
+  const next = WIDTH_MODES[(WIDTH_MODES.indexOf(cur) + 1) % WIDTH_MODES.length]
+  applyReaderWidth(next)
+  readerTip(`阅读宽度：${WIDTH_LABEL[next]}`)
+})
+
+el.readerFull.addEventListener('click', async () => {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen()
+    else await el.reader.requestFullscreen()
+  } catch {
+    readerTip('这个浏览器不支持全屏')
+  }
+})
+
+// 滚动：进度条实时更新，页码靠 IntersectionObserver
+let scrollTick = 0
+el.readerScroll.addEventListener(
+  'scroll',
+  () => {
+    if (scrollTick) return
+    scrollTick = requestAnimationFrame(() => {
+      scrollTick = 0
+      updateReaderProgress()
+    })
+  },
+  { passive: true },
+)
 
 // ---------------------------------------------------------------------------
 // 设置
@@ -1148,6 +1649,45 @@ el.testProxy.addEventListener('click', async () => {
 // ---------------------------------------------------------------------------
 
 document.addEventListener('keydown', (e) => {
+  // 阅读器打开时先接管键盘：上下翻页由阅读区自己滚，不做整页滚动
+  if (state.reader.open) {
+    const tag = (e.target?.tagName || '').toLowerCase()
+    const typing = tag === 'input' || tag === 'textarea' || tag === 'select'
+    const step = () => el.readerScroll.clientHeight * 0.88
+
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      closeReader()
+      return
+    }
+    if (typing) return
+
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault()
+      readerStep(-1)
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault()
+      readerStep(1)
+    } else if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === ' ') {
+      e.preventDefault()
+      el.readerScroll.scrollBy({ top: step(), behavior: 'smooth' })
+    } else if (e.key === 'ArrowUp' || e.key === 'PageUp') {
+      e.preventDefault()
+      el.readerScroll.scrollBy({ top: -step(), behavior: 'smooth' })
+    } else if (e.key === 'Home') {
+      e.preventDefault()
+      el.readerScroll.scrollTo({ top: 0, behavior: 'smooth' })
+    } else if (e.key === 'End') {
+      e.preventDefault()
+      el.readerScroll.scrollTo({ top: el.readerScroll.scrollHeight, behavior: 'smooth' })
+    } else if (e.key === 'w' || e.key === 'W') {
+      el.readerWidth.click()
+    } else if (e.key === 'f' || e.key === 'F') {
+      el.readerFull.click()
+    }
+    return
+  }
+
   if (e.key === 'Escape') {
     if (el.settings.classList.contains('open')) closeSettings()
     else if (el.drawer.classList.contains('open')) closeDrawer()
@@ -1210,6 +1750,9 @@ async function boot() {
 
   if (refreshTimer) clearInterval(refreshTimer)
   refreshTimer = setInterval(refreshCacheStat, 60000)
+
+  // 刷新 / 分享链接直接落在某一章：等基础数据回来再进阅读器
+  openReaderFromHash()
 }
 
 // 统计区点一下重连（离线时才会生效）

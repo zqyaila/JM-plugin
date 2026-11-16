@@ -4,9 +4,9 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="color-scheme" content="dark" />
-<title>JM Reader · PDF 下载器</title>
+<title>JM Reader · 在线阅读与 PDF 下载</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff4d6d'/%3E%3Cpath d='M9 8h9a4 4 0 0 1 4 4v12H13a4 4 0 0 0-4 4V8z' fill='%23fff'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/style.css?v=9" />
+<link rel="stylesheet" href="/style.css?v=14" />
 <script>
   try {
     if (localStorage.getItem('jm-gate-accepted') === '1') document.documentElement.classList.add('gate-passed')
@@ -20,7 +20,7 @@
   <div class="gate-card">
     <div class="gate-badge">18+</div>
     <h1>JM Reader <span>Web</span></h1>
-    <p class="gate-lead">一个把漫画抓取、图片还原与 PDF 合成搬到浏览器里的本地工具。</p>
+    <p class="gate-lead">一个把漫画抓取、图片还原、在线阅读与 PDF 合成搬到浏览器里的本地工具。</p>
     <ul class="gate-list">
       <li>本工具不托管、不存储、不传播任何内容，全部图文均来自第三方站点。</li>
       <li>请确认你已年满 18 周岁，且所在国家或地区法律允许访问此类内容。</li>
@@ -74,7 +74,7 @@
     <div class="hero-copy">
       <p class="eyebrow">JM READER · WEB EDITION</p>
       <h1>搜一部作品，<br /><span>拿一份 PDF。</span></h1>
-      <p class="hero-sub">自动抓取章节、还原被打乱的图片、按页合成 PDF，支持 HTTP / SOCKS5 代理下载。</p>
+      <p class="hero-sub">自动抓取章节、还原被打乱的图片，在线直接阅读，或按页合成 PDF；支持 HTTP / SOCKS5 代理下载。</p>
     </div>
     <div class="hero-stats" id="hero-stats">
       <div class="stat"><b id="stat-cache">–</b><span>本地缓存</span></div>
@@ -117,8 +117,8 @@
       </div>
       <div class="step">
         <b>03</b>
-        <h4>下载</h4>
-        <p>自动抓图、还原打乱页、合成为 PDF</p>
+        <h4>阅读 / 下载</h4>
+        <p>在线连续阅读，或自动抓图合成 PDF</p>
       </div>
     </div>
   </div>
@@ -235,8 +235,51 @@
   </footer>
 </div>
 
+<!-- 在线阅读器 -->
+<div class="reader" id="reader" aria-hidden="true">
+  <header class="reader-bar">
+    <button class="icon-btn" id="reader-back" aria-label="返回">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M15 5l-7 7 7 7" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <div class="reader-info">
+      <b id="reader-title">加载中…</b>
+      <span id="reader-sub"></span>
+    </div>
+    <div class="reader-actions">
+      <select id="reader-chapter" aria-label="选择章节"></select>
+      <button class="icon-btn" id="reader-width" title="切换阅读宽度" aria-label="切换阅读宽度">
+        <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2.5" stroke="currentColor" stroke-width="1.7"/><path d="M8.5 5v14M15.5 5v14" stroke="currentColor" stroke-width="1.4" opacity=".45"/></svg>
+      </button>
+      <button class="icon-btn" id="reader-full" title="全屏" aria-label="全屏">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="reader-stage" id="reader-stage" data-width="fit">
+    <div class="reader-scroll" id="reader-scroll">
+      <div class="reader-pages" id="reader-pages"></div>
+      <div class="reader-end" id="reader-end" hidden></div>
+    </div>
+    <div class="reader-state" id="reader-state">
+      <span class="reader-spinner"></span>
+      <p id="reader-state-text">正在加载章节…</p>
+      <button class="btn ghost" id="reader-retry" hidden>重试</button>
+    </div>
+  </div>
+
+  <footer class="reader-foot">
+    <button class="btn ghost" id="reader-prev-ch">上一章</button>
+    <div class="reader-meter" id="reader-meter"><i id="reader-progress"></i></div>
+    <span class="reader-pos" id="reader-pos">– / –</span>
+    <button class="btn ghost" id="reader-next-ch">下一章</button>
+  </footer>
+
+  <div class="reader-tip" id="reader-tip">滚动阅读 · ← → 切换章节 · Esc 退出</div>
+</div>
+
 <div class="toasts" id="toasts"></div>
 
-<script type="module" src="/app.js?v=9"></script>
+<script type="module" src="/app.js?v=14"></script>
 </body>
 </html>

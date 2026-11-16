@@ -471,16 +471,32 @@ export async function resolveChapters(repo, albumId, range = null) {
   return { detail, series, chapters }
 }
 
-/** 只收集页面元信息（url 字符串），不碰图片字节，几百页也就几十 KB。 */
-async function pagesOfChapter(client, repo, chapter, albumId) {
+/**
+ * 只收集页面元信息（url 字符串），不碰图片字节，几百页也就几十 KB。
+ *
+ * 导出给网页阅读器复用：阅读器和 PDF 必须用同一套 aid / scrambleId，
+ * 否则还原出来的页会是错位的（同一页在 PDF 里正常、在网页里花掉）。
+ */
+export async function chapterPages(client, repo, chapter, albumId) {
   const rd = await repo.comicRead(chapter.id)
   const aid = Number(rd.id) || Number(albumId)
-  return (rd.images || []).map((p) => ({
-    url: client.imgUrl(p.image),
-    aid,
-    scrambleId: rd.scrambleId,
-    page: p.page,
-  }))
+  return {
+    id: String(rd.id || chapter.id),
+    name: rd.name || chapter.name || '',
+    scrambleId: Number(rd.scrambleId) || 0,
+    totalPage: Number(rd.totalPage) || 0,
+    pages: (rd.images || []).map((p) => ({
+      url: client.imgUrl(p.image),
+      aid,
+      scrambleId: rd.scrambleId,
+      page: p.page,
+    })),
+  }
+}
+
+async function pagesOfChapter(client, repo, chapter, albumId) {
+  const info = await chapterPages(client, repo, chapter, albumId)
+  return info.pages
 }
 
 /**

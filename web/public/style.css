@@ -1034,3 +1034,261 @@ html.gate-passed .gate { display: none; }
   white-space: nowrap;
 }
 
+/* =========================================================
+   在线阅读器
+   ========================================================= */
+
+body.reading { overflow: hidden; }
+
+.reader {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh; /* 手机浏览器地址栏收起/展开时，别让底栏被顶到屏幕外 */
+  background: #050508;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(12px);
+  transition: opacity 0.24s var(--ease), transform 0.24s var(--ease);
+}
+.reader.open { opacity: 1; pointer-events: auto; transform: none; }
+
+.reader-bar {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 58px;
+  padding: 0 14px;
+  padding-top: env(safe-area-inset-top);
+  background: rgba(8, 8, 12, 0.86);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.reader-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.reader-info b {
+  font-size: 13.5px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.reader-info span { font-size: 11px; color: var(--text-mute); }
+.reader-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.reader-actions select {
+  max-width: 190px;
+  height: 34px;
+  padding: 0 9px;
+  font-size: 12.5px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.055);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  outline: 0;
+  appearance: none;
+  text-overflow: ellipsis;
+}
+.reader-actions select:focus { border-color: rgba(255, 77, 109, 0.5); }
+.reader-actions .icon-btn { width: 34px; height: 34px; border-radius: 9px; }
+.reader-actions .icon-btn svg { width: 16px; height: 16px; }
+
+.reader-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background:
+    radial-gradient(900px 500px at 50% -10%, rgba(255, 77, 109, 0.06), transparent 70%),
+    #050508;
+}
+.reader-scroll {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  padding: 18px 0 30px;
+}
+.reader-scroll::-webkit-scrollbar { width: 9px; }
+.reader-scroll::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.14); border-radius: 9px; }
+
+.reader-pages {
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 0 12px;
+  display: flex;
+  flex-direction: column;
+  transition: max-width 0.25s var(--ease);
+}
+.reader-stage[data-width='wide'] .reader-pages { max-width: 1180px; }
+.reader-stage[data-width='full'] .reader-pages { max-width: none; padding: 0; }
+
+.rpage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  background: linear-gradient(100deg, #0d0d14 20%, #16161f 38%, #0d0d14 56%);
+  background-size: 220% 100%;
+  animation: shimmer 1.4s infinite linear;
+  overflow: hidden;
+}
+.reader-stage[data-width='full'] .rpage { max-height: 100vh; }
+.rpage img {
+  display: block;
+  width: 100%;
+  height: auto;
+  opacity: 0;
+  transition: opacity 0.32s ease;
+}
+.rpage.loaded { background: #0a0a0f; animation: none; aspect-ratio: auto; }
+.rpage.loaded img { opacity: 1; }
+.rpage.failed { animation: none; background: #101018; }
+.rpage-fail {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 10px;
+  justify-items: center;
+  font-size: 12.5px;
+  color: var(--text-mute);
+  text-align: center;
+  padding: 16px;
+}
+.rpage-fail button {
+  height: 32px;
+  padding: 0 14px;
+  font-size: 12.5px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+}
+
+.reader-state {
+  position: absolute;
+  inset: 0;
+  display: none;
+  place-content: center;
+  justify-items: center;
+  gap: 14px;
+  background: rgba(5, 5, 8, 0.9);
+  text-align: center;
+  padding: 24px;
+  z-index: 2;
+}
+.reader-stage.loading .reader-state { display: grid; }
+.reader-state p { margin: 0; font-size: 13px; color: var(--text-dim); max-width: 320px; line-height: 1.7; }
+.reader-spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.reader-end {
+  max-width: 860px;
+  margin: 6px auto 0;
+  padding: 34px 18px 46px;
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  text-align: center;
+  border-top: 1px solid var(--line);
+}
+.reader-end p { margin: 0; font-size: 13px; color: var(--text-mute); }
+.reader-end .btn { min-width: 150px; }
+
+.reader-foot {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 56px;
+  padding: 0 16px;
+  padding-bottom: env(safe-area-inset-bottom);
+  background: rgba(8, 8, 12, 0.9);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border-top: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.reader-foot .btn { height: 34px; padding: 0 14px; font-size: 12.5px; border-radius: 9px; }
+.reader-meter {
+  position: relative;
+  flex: 1;
+  height: 4px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.reader-meter i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 0.16s linear;
+}
+.reader-pos {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  min-width: 64px;
+  text-align: center;
+}
+.reader-foot .btn:disabled { opacity: 0.32; }
+
+.reader-tip {
+  position: absolute;
+  left: 50%;
+  bottom: 76px;
+  transform: translateX(-50%) translateY(6px);
+  padding: 7px 14px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  background: rgba(20, 20, 30, 0.9);
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.4s, transform 0.4s;
+  white-space: nowrap;
+  z-index: 4;
+}
+.reader-tip.show { opacity: 1; transform: translateX(-50%); }
+
+@media (max-width: 640px) {
+  .reader-bar { height: 52px; gap: 8px; padding: 0 10px; padding-top: env(safe-area-inset-top); }
+  .reader-info { gap: 0; }
+  .reader-info b { font-size: 13px; }
+  .reader-info span { display: none; }
+  .reader-actions { gap: 6px; }
+  .reader-actions select { max-width: 96px; height: 32px; font-size: 12px; padding: 0 7px; }
+  .reader-actions #reader-width { display: none; }
+  .reader-pages { padding: 0; }
+  .reader-scroll { padding-top: 0; }
+  .reader-foot { height: 52px; gap: 10px; padding: 0 10px; padding-bottom: env(safe-area-inset-bottom); }
+  .reader-foot .btn { padding: 0 10px; font-size: 12px; }
+  .reader-pos { min-width: 54px; }
+  .reader-tip { display: none; }
+  .drawer-foot { gap: 10px; }
+  .drawer-foot .summary { display: none; }
+  .drawer-foot .btn { flex: 1; }
+}
+
+/* 详情页底部的「在线阅读」与主按钮并排 */
+.drawer-foot .btn.ghost { flex-shrink: 0; }
+

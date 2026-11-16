@@ -19,7 +19,7 @@ import { readFile, stat } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 
 import JmClient from '../apps/jmcore.js'
-import JmRepository, { resolveChapters } from '../apps/jm.js'
+import JmRepository, { resolveChapters, chapterPages, fetchPageImageRetry } from '../apps/jm.js'
 import { getCachedPdf, listCache, removeCachedPdf, PDF_DIR } from '../apps/store.js'
 import { proxyRequest, testProxy, parseProxyList, maskProxy } from '../apps/proxy.js'
 import { config, loadConfig, saveConfig, publicConfig, resolveServerOptions } from './config.js'
@@ -246,6 +246,9 @@ async function handleAlbum(url, res) {
 
   await ensureClient()
   const d = await repo.getAlbum(id)
+  // 顺手给阅读器留一份章节表：从详情页点「在线阅读」时就不用再拉一次详情
+  seriesCache.set(id, { detail: d, time: Date.now() })
+  if (seriesCache.size > 40) seriesCache.delete(seriesCache.keys().next().value)
   const series = d.series.length
     ? d.series
     : [{ id: d.id, sort: 1, name: d.name, totalPage: d.totalPhotos }]
@@ -367,6 +370,320 @@ async function handleCover(url, res) {
     res.end('cover fetch failed')
   } finally {
     freeCoverSlot()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 在线阅读
+//
+// 阅读器与 PDF 是两条路：PDF 为了离线保存（要转码、要压缩、要合成），
+// 阅读要的是「点开就能看」，所以这里只做两件事：
+//
+//   GET /api/read?id=&chapter=   章节页表（只拿图片地址，几十 KB）
+//   GET /api/page?c=&p=          单页图片（服务端还原打乱，带内存缓存）
+//
+// 前端只传「章节 id + 页码」，真正的图片地址由服务端从 API 取，
+// 这样这个接口不会被当成任意 URL 的代理（SSRF）。
+// ---------------------------------------------------------------------------
+
+const READ_META_TTL = 30 * 60 * 1000
+const READ_META_MAX = 80
+const readMeta = new Map() // chapterId -> { albumId, chapter, info, time }
+
+// 章节列表 5 分钟内复用：翻下一章时只多一次 comic_read 请求，
+// 而不是「拉详情 + 拉页表」两跳，切章体感快很多。
+const SERIES_TTL = 5 * 60 * 1000
+const seriesCache = new Map() // albumId -> { detail, time }
+
+const PAGE_TTL = 2 * 60 * 60 * 1000
+const PAGE_CACHE_MAX = 192 * 1024 * 1024
+const pageCache = new Map() // `${chapterId}:${p}` -> { buf, type, etag, time }
+let pageCacheBytes = 0
+
+/** 同时最多向图源要 6 张图，再多只会把出口带宽和代理打满，页面反而更慢。 */
+function createGate(limit) {
+  let busy = 0
+  const queue = []
+  return {
+    take() {
+      if (busy < limit) {
+        busy++
+        return Promise.resolve()
+      }
+      return new Promise((resolve) => queue.push(resolve))
+    },
+    free() {
+      const next = queue.shift()
+      if (next) next()
+      else busy--
+    },
+  }
+}
+
+const pageGate = createGate(6)
+// 后台预热单独一套名额：否则上一章还在预热的 6 个请求会把新章节的首屏堵在后面
+const prefetchGate = createGate(2)
+
+function rememberPage(key, item) {
+  const old = pageCache.get(key)
+  if (old) pageCacheBytes -= old.buf.length
+  pageCache.delete(key)
+  pageCache.set(key, item)
+  pageCacheBytes += item.buf.length
+  while (pageCacheBytes > PAGE_CACHE_MAX && pageCache.size > 1) {
+    const [k, v] = pageCache.entries().next().value
+    pageCache.delete(k)
+    pageCacheBytes -= v.buf.length
+  }
+}
+
+function pruneReadMeta() {
+  const now = Date.now()
+  for (const [k, v] of readMeta) {
+    if (now - v.time > READ_META_TTL) readMeta.delete(k)
+  }
+  while (readMeta.size > READ_META_MAX) {
+    readMeta.delete(readMeta.keys().next().value)
+  }
+}
+
+/** 按文件头判断图片格式：图源混着 jpg / webp / png，靠扩展名不可靠。 */
+function sniffImageType(buf) {
+  if (!buf || buf.length < 12) return 'image/jpeg'
+  if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg'
+  if (buf[0] === 0x89 && buf[1] === 0x50) return 'image/png'
+  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp'
+  if (buf.toString('ascii', 0, 4) === 'GIF8') return 'image/gif'
+  return 'image/jpeg'
+}
+
+let _viewSharp = null
+async function getViewSharp() {
+  if (_viewSharp === null) {
+    try {
+      const mod = await import('sharp')
+      _viewSharp = mod.default ?? mod
+    } catch {
+      _viewSharp = false
+    }
+  }
+  return _viewSharp || null
+}
+
+/**
+ * 还原后的图是 sharp 输出的 PNG，一页动辄两三 MB，翻几页就把手机内存吃满。
+ * 统一转成 JPEG（网页阅读对无损没有要求），体积能降一个数量级。
+ */
+async function shrinkForView(buf, type) {
+  if (type !== 'image/png') return { buf, type }
+  const sharp = await getViewSharp()
+  if (!sharp) return { buf, type }
+  try {
+    const out = await sharp(buf).jpeg({ quality: 88 }).toBuffer()
+    return out.length < buf.length ? { buf: out, type: 'image/jpeg' } : { buf, type }
+  } catch {
+    return { buf, type }
+  }
+}
+
+function sendPageImage(req, res, item) {
+  if (req.headers['if-none-match'] === item.etag) {
+    res.writeHead(304, { ETag: item.etag, 'Cache-Control': 'private, max-age=86400' })
+    return res.end()
+  }
+  res.writeHead(200, {
+    'Content-Type': item.type,
+    'Content-Length': item.buf.length,
+    ETag: item.etag,
+    'Cache-Control': 'private, max-age=86400',
+    'X-Content-Type-Options': 'nosniff',
+  })
+  res.end(item.buf)
+}
+
+/** 章节页表：detail 里的 series 决定顺序，sort 是前端认的章节号。 */
+async function handleRead(url, res) {
+  const id = normalizeAlbumId(url.searchParams.get('id'))
+  if (!id) return sendError(res, 400, 'JM 号不合法')
+  const wantSort = (url.searchParams.get('chapter') || '').trim()
+
+  await ensureClient()
+  let cached = seriesCache.get(id)
+  if (!cached || Date.now() - cached.time > SERIES_TTL) {
+    const detail = await repo.getAlbum(id)
+    cached = { detail, time: Date.now() }
+    seriesCache.set(id, cached)
+    if (seriesCache.size > 40) seriesCache.delete(seriesCache.keys().next().value)
+  }
+  const detail = cached.detail
+  const series = detail.series.length
+    ? detail.series
+    : [{ id: detail.id, sort: 1, name: detail.name, totalPage: detail.totalPhotos || 0 }]
+
+  const chapter =
+    wantSort === ''
+      ? series[0]
+      : series.find((s) => String(s.sort) === wantSort) || series.find((s) => String(s.id) === wantSort)
+  if (!chapter) return sendError(res, 404, '章节不存在')
+
+  const chapterId = String(chapter.id)
+  const prev = readMeta.get(chapterId)
+  const fresh = prev && Date.now() - prev.time < READ_META_TTL
+  // 5 分钟内重复打开同一章（翻回来、刷新）就直接用上次的页表，少一次接口请求
+  const info = fresh ? prev.info : await chapterPages(client, repo, chapter, id)
+  if (!info.pages.length) return sendError(res, 404, '这一章没有可阅读的页面')
+
+  const meta = {
+    albumId: id,
+    chapter,
+    info,
+    dims: (fresh && prev.dims) || {},
+    time: Date.now(),
+  }
+  readMeta.set(String(info.id), meta)
+  pruneReadMeta()
+
+  // 先量出第一屏这两页的真实尺寸：阅读器按真实比例占位，图片到位不再跳动。
+  // 只等两页是为了别让「点开章节」等上五六秒；其余页放在后台预热，
+  // 用户往下滚时多半已经进了内存缓存。
+  await Promise.allSettled(
+    info.pages.slice(0, 2).map((_, i) => ensurePageImage(String(info.id), i + 1, meta)),
+  )
+  void Promise.allSettled(
+    info.pages.slice(2, 8).map((_, i) => ensurePageImage(String(info.id), i + 3, meta, prefetchGate)),
+  )
+
+  const index = series.findIndex((s) => s.sort === chapter.sort)
+  const token = url.searchParams.get('token') || ''
+  const suffix = token ? `&token=${encodeURIComponent(token)}` : ''
+
+  sendJson(res, 200, {
+    ok: true,
+    album: {
+      id: detail.id,
+      name: detail.name,
+      authors: detail.authors,
+      cover: `/api/cover?id=${encodeURIComponent(detail.id)}&v=${detail.addtime || 0}`,
+    },
+    chapter: {
+      id: info.id,
+      sort: chapter.sort,
+      name: chapter.name || info.name || `第${chapter.sort}章`,
+      index: index + 1,
+      total: series.length,
+      pageCount: info.pages.length,
+    },
+    chapters: series.map((s) => ({
+      sort: s.sort,
+      name: s.name,
+      totalPage: Number(s.totalPage) || 0,
+    })),
+    // src 不带 token，前端统一在 <img src> 上补；w/h 用于按真实比例占位
+    pages: info.pages.map((_, i) => {
+      const d = meta.dims?.[i + 1]
+      return {
+        i: i + 1,
+        src: `/api/page?c=${encodeURIComponent(info.id)}&p=${i + 1}${suffix}`,
+        w: d ? d[0] : 0,
+        h: d ? d[1] : 0,
+      }
+    }),
+  })
+}
+
+/**
+ * 取一页图片（内存缓存优先）。handlePage 与「预量尺寸」共用同一条路径，
+ * 保证缓存键、格式转换、尺寸记录完全一致。
+ */
+const pageInflight = new Map() // 同一页被「预取」和「浏览器请求」同时要时，只抓一次
+
+async function ensurePageImage(cid, p, meta, gate = pageGate) {
+  const key = `${cid}:${p}`
+  const hit = pageCache.get(key)
+  if (hit && Date.now() - hit.time < PAGE_TTL) {
+    pageCache.delete(key) // 挪到队尾，Map 就是 LRU
+    pageCache.set(key, hit)
+    return hit
+  }
+  const pending = pageInflight.get(key)
+  if (pending) return pending
+
+  const page = meta?.info?.pages?.[p - 1]
+  if (!page) return null
+
+  const task = (async () => {
+    await ensureClient()
+    await gate.take()
+    try {
+      const raw = await fetchPageImageRetry(client, page.url, page.aid, page.scrambleId, {
+        retries: 1,
+        retryDelay: 600,
+      })
+      const type = sniffImageType(raw.buf)
+      const view = await shrinkForView(raw.buf, type)
+
+      let w = 0
+      let h = 0
+      const sharp = await getViewSharp()
+      if (sharp) {
+        try {
+          const m = await sharp(view.buf).metadata()
+          w = m.width || 0
+          h = m.height || 0
+        } catch {
+          /* 读不出尺寸只影响占位，不影响显示 */
+        }
+      }
+
+      const item = {
+        buf: view.buf,
+        type: view.type,
+        etag: `"${crypto.createHash('md5').update(view.buf).digest('hex')}"`,
+        time: Date.now(),
+        w,
+        h,
+      }
+      rememberPage(key, item)
+      if (meta && w && h) {
+        meta.dims = meta.dims || {}
+        meta.dims[p] = [w, h]
+      }
+      return item
+    } finally {
+      gate.free()
+    }
+  })()
+
+  pageInflight.set(key, task)
+  try {
+    return await task
+  } finally {
+    pageInflight.delete(key)
+  }
+}
+
+async function handlePage(url, req, res) {
+  const cid = String(url.searchParams.get('c') || '').replace(/\D/g, '')
+  const p = parseInt(url.searchParams.get('p'), 10) || 0
+  if (!cid || p < 1) return sendError(res, 400, '参数不合法')
+
+  const key = `${cid}:${p}`
+  let meta = readMeta.get(cid)
+  if ((!meta || Date.now() - meta.time > READ_META_TTL) && !pageCache.has(key)) {
+    // 服务重启 / 元信息被回收：重拉一次页表。仍然只信任 API 返回的图片地址。
+    const albumId = meta?.albumId || ''
+    const info = await chapterPages(client, repo, { id: cid, name: '', sort: 0 }, albumId)
+    meta = { albumId, chapter: null, info, dims: {}, time: Date.now() }
+    readMeta.set(cid, meta)
+    pruneReadMeta()
+  }
+
+  try {
+    const item = await ensurePageImage(cid, p, meta)
+    if (!item) return sendError(res, 404, '页码超出范围')
+    sendPageImage(req, res, item)
+  } catch (err) {
+    sendError(res, 502, err?.serverMessage || err?.message || '图片获取失败')
   }
 }
 
@@ -635,6 +952,8 @@ async function handleApi(req, res, url) {
     if (method === 'GET' && p === '/search') return await handleSearch(url, res)
     if (method === 'GET' && p === '/album') return await handleAlbum(url, res)
     if (method === 'GET' && p === '/cover') return await handleCover(url, res)
+    if (method === 'GET' && p === '/read') return await handleRead(url, res)
+    if (method === 'GET' && p === '/page') return await handlePage(url, req, res)
 
     if (method === 'POST' && p === '/jobs') return await handleCreateJob(req, res)
     if (method === 'GET' && p === '/jobs') return sendJson(res, 200, { ok: true, jobs: jobs.list() })
