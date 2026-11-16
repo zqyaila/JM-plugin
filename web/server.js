@@ -10,6 +10,7 @@
  */
 
 import http from 'node:http'
+import os from 'node:os'
 import crypto from 'node:crypto'
 import path from 'node:path'
 import fs from 'node:fs'
@@ -46,6 +47,20 @@ const client = new JmClient()
 const repo = new JmRepository(client)
 const jobs = createJobManager({ client, repo, getConfig: () => config })
 const options = resolveServerOptions()
+
+/** 列出本机所有非回环 IPv4，启动时直接告诉用户「别的设备该访问哪个地址」。 */
+function lanUrls(port) {
+  const out = []
+  for (const [name, list] of Object.entries(os.networkInterfaces())) {
+    for (const it of list || []) {
+      if (it.family !== 'IPv4' || it.internal) continue
+      // 100.64.0.0/10 是 CGNAT 段，Tailscale / ZeroTier 这类组网工具都用它
+      const cgnat = /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(it.address)
+      out.push({ url: `http://${it.address}:${port}`, tag: cgnat ? '组网地址' : name })
+    }
+  }
+  return out
+}
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -734,16 +749,49 @@ async function main() {
     if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
   })
 
+  // 端口被占 / 没权限绑定低端口时，给出人能看懂的提示，而不是一串 node 堆栈
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error('')
+      console.error(`  ✗ 端口 ${options.port} 已被占用。`)
+      console.error('    多半是上一次的服务还在后台跑（它可能只监听了 127.0.0.1，所以你从别的设备访问不到）。')
+      console.error(`    先结束旧进程：lsof -i :${options.port}  或  kill $(pgrep -f "web/server.js")`)
+      console.error('    或者换个端口启动：npm run web:lan -- --port 7789')
+      console.error('')
+    } else if (err.code === 'EACCES') {
+      console.error(`  ✗ 没有权限监听 ${options.host}:${options.port}，请换一个大于 1024 的端口。`)
+    } else {
+      console.error('  ✗ 服务启动失败：', err)
+    }
+    process.exit(1)
+  })
+
   server.listen(options.port, options.host, () => {
     const host = options.host === '0.0.0.0' ? 'localhost' : options.host
     console.log('')
     console.log('  JM Reader Web 已启动')
-    console.log(`  ➜  http://${host}:${options.port}`)
-    console.log(`  ➜  监听 ${options.host}:${options.port}${options.token ? '（已启用访问口令）' : ''}`)
-    if (options.host === '0.0.0.0' && !options.token) {
-      console.warn('  ⚠️  已对局域网/公网开放，但没有设置访问口令 —— 拿到地址的人都能用')
-      console.warn('     建议改为：--host 0.0.0.0 --token 你的口令')
+    console.log(`  ➜  http://${host}:${options.port}${options.token ? `?token=${options.token}` : ''}`)
+
+    if (options.host === '0.0.0.0' || options.host === '::') {
+      console.log(`  ➜  监听 ${options.host}:${options.port}（局域网 / 组网可访问）`)
+      const urls = lanUrls(options.port)
+      if (urls.length) {
+        console.log('  ➜  其它设备可用的地址：')
+        for (const it of urls) console.log(`       ${it.url}   (${it.tag})`)
+      } else {
+        console.log('  ➜  没有检测到非回环网卡，检查一下网络连接')
+      }
+      if (!options.token) {
+        console.warn('  ⚠️  已对本机以外的设备开放，但没有设置访问口令 —— 拿到地址的人都能用')
+        console.warn('     建议改为：--host 0.0.0.0 --token 你的口令')
+      }
+    } else {
+      console.log(`  ➜  监听 ${options.host}:${options.port}`)
+      console.warn('  ⚠️  当前只允许本机访问：手机 / 平板 / 其它电脑连不上。')
+      console.warn('     要组网或局域网访问，用：npm run web:lan')
+      console.warn('     或：node web/server.js --host 0.0.0.0 --token 你的口令')
     }
+
     if (options.trustProxy) console.log('  ➜  信任反向代理的 X-Forwarded-For')
     console.log(`  ➜  代理：${client.proxySummary().text}`)
     console.log(`  ➜  数据目录：${path.join(__dirname, '..', 'data')}`)

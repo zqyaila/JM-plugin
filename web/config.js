@@ -121,9 +121,20 @@ export function resolveServerOptions(argv = process.argv.slice(2)) {
     return i >= 0 ? argv[i + 1] : undefined
   }
   const flag = (name) => argv.includes(`--${name}`)
+
+  // --host lan / --host localhost 这类简写，省得记 IP
+  const hostAlias = {
+    lan: '0.0.0.0',
+    all: '0.0.0.0',
+    any: '0.0.0.0',
+    local: '127.0.0.1',
+    localhost: '127.0.0.1',
+  }
+  const rawHost = arg('host') || process.env.JM_HOST || '127.0.0.1'
+
   return {
     port: Number(arg('port') || process.env.JM_PORT || process.env.PORT || 7788),
-    host: arg('host') || process.env.JM_HOST || '127.0.0.1',
+    host: hostAlias[String(rawHost).toLowerCase()] || rawHost,
     token: arg('token') || process.env.JM_TOKEN || '',
     // 只有明确声明反代时才信任 X-Forwarded-For：否则客户端可伪造 IP 绕过口令限流
     trustProxy: flag('trust-proxy') || process.env.JM_TRUST_PROXY === '1',
