@@ -126,20 +126,6 @@ export async function fetchPageImageRetry(client, url, aid, scrambleId, { retrie
   throw lastErr || new Error('图片下载失败')
 }
 
-/** 并发控制：限制同时执行的任务数。 */
-async function mapConcurrent(items, limit, fn) {
-  const results = new Array(items.length)
-  let idx = 0
-  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
-    while (idx < items.length) {
-      const i = idx++
-      results[i] = await fn(items[i], i)
-    }
-  })
-  await Promise.all(workers)
-  return results
-}
-
 function fileName(url) {
   const path = String(url).split('?')[0]
   const seg = path.split('/').pop()
@@ -522,17 +508,34 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
     version: m.ePDFVersion17,
   })
 
-  // 阶段一：并发下载所有页（每张失败重试 retries 次，间隔 retryDelay ms）
-  if (onProgress) onProgress(0, allPages.length)
-  const downloaded = await mapConcurrent(allPages, concurrency, async (pg, i) => {
-    const r = await fetchPageImageRetry(client, pg.url, pg.aid, pg.scrambleId, { retries, retryDelay })
-    if (onProgress) onProgress(i + 1, allPages.length)
-    return r
-  })
+  // 阶段一：按页序「下载 → 压缩 → 写入」流水线推进。
+  // 不能先把整本图片下完再写：几百页会同时占着「全部原图 + WASM 里的 PDF + 成品副本」，
+  // WASM 线性内存撑不住会直接 Aborted()。这里用滑动窗口，内存里最多留 concurrency 张图。
+  const total = allPages.length
+  if (onProgress) onProgress(0, total)
 
-  // 阶段二：按顺序转 JPEG 并嵌入 PDF（保证页序正确）
-  for (let i = 0; i < downloaded.length; i++) {
-    const { buf } = downloaded[i]
+  const windowSize = Math.max(1, Math.min(concurrency, total))
+  const inflight = new Map()
+
+  const openPage = (i) => {
+    const pg = allPages[i]
+    return fetchPageImageRetry(client, pg.url, pg.aid, pg.scrambleId, { retries, retryDelay })
+      .then((r) => ({ ok: true, r }))
+      .catch((error) => ({ ok: false, error }))
+  }
+
+  for (let i = 0; i < windowSize; i++) inflight.set(i, openPage(i))
+
+  for (let i = 0; i < total; i++) {
+    const slot = await inflight.get(i)
+    inflight.delete(i)
+    if (!slot.ok) throw slot.error
+
+    // 立刻补位，让下载在写 PDF 的同时继续跑
+    const nextIdx = i + windowSize
+    if (nextIdx < total) inflight.set(nextIdx, openPage(nextIdx))
+
+    const { buf } = slot.r
     let jpeg = buf
     try {
       const meta = await sharp(buf).metadata()
@@ -553,6 +556,8 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
     const ctx = writer.startPageContentContext(page)
     ctx.drawImage(0, 0, jpeg, { transformation: { width, height } })
     writer.writePage(page)
+
+    if (onProgress) onProgress(i + 1, total)
   }
 
   const bytes = writer.end()
