@@ -42,6 +42,13 @@ const store = {
       /* 存不下就算了，不影响本次使用 */
     }
   },
+  remove(key) {
+    try {
+      localStorage.removeItem(key)
+    } catch {
+      /* 隐私模式下删不掉也无所谓 */
+    }
+  },
 }
 
 // 兜底：脚本出错时给个看得见的提示，而不是让页面静默变成「什么都点不动」
@@ -191,6 +198,16 @@ function toast(message, type = '') {
   }, type === 'err' ? 5000 : 2800)
 }
 
+// 同一句话短时间内只提醒一次：一次刷新会并发好几个请求，
+// 全部 429 时能叠出六七条一模一样的红色提示。
+const lastToast = new Map()
+function toastOnce(message, type = '') {
+  const key = `${type}|${message}`
+  if (Date.now() - (lastToast.get(key) || 0) < 4000) return
+  lastToast.set(key, Date.now())
+  toast(message, type)
+}
+
 // 所有请求都带超时：后端要是卡在主机发现/生成 PDF，界面得给个说法，
 // 而不是让三个统计数字一直停在「–」。
 const DEFAULT_TIMEOUT = 15000
@@ -222,8 +239,28 @@ async function api(path, { method = 'GET', body, timeout = DEFAULT_TIMEOUT } = {
 
     const data = await res.json().catch(() => ({}))
     if (res.status === 401) {
+      // 本机存的口令对不上（服务端换过口令）：先扔掉，否则之后每个请求都会
+      // 带着这个错口令再撞一次，几次刷新就把自己送进锁定名单。
+      const had = !!state.token
+      if (had) {
+        state.token = ''
+        store.remove('jm-token')
+      }
       openAuth()
+      // 告诉用户为什么突然弹窗，而不是让口令框无缘无故跳出来
+      if (had && el.authError && !el.authError.textContent.trim()) {
+        el.authError.innerHTML = '<div class="bad">本机保存的口令已失效，请重新输入</div>'
+      }
       throw new Error('需要访问口令')
+    }
+    if (res.status === 429) {
+      // 被限流说明口令试错太多次。服务端对「口令正确」是立刻放行的，
+      // 所以这里仍把口令框露出来：输对一次就能当场解锁，不用干等十分钟。
+      const msg = data.error || '口令错误次数过多，请稍后再试'
+      toastOnce(msg, 'err')
+      openAuth()
+      if (el.authError) el.authError.innerHTML = `<div class="bad">${esc(msg)}<br />输入正确口令可立即恢复</div>`
+      throw new Error(msg)
     }
     if (!res.ok || data.ok === false) throw new Error(data.error || `请求失败（HTTP ${res.status}）`)
     return data
@@ -374,7 +411,7 @@ function renderGrid(items, meta) {
       (it, i) => `
       <article class="card" data-id="${esc(it.id)}" style="animation-delay:${Math.min(i * 22, 320)}ms">
         <span class="card-id">JM${esc(it.id)}</span>
-        <img src="${esc(it.cover)}" alt="" loading="lazy" decoding="async"
+        <img src="${esc(withToken(it.cover))}" alt="" loading="lazy" decoding="async"
              onerror="this.style.opacity='.25';this.removeAttribute('src')" />
         <div class="card-body">
           <div class="card-title">${esc(it.name)}</div>
@@ -526,7 +563,7 @@ function renderDetail(album) {
 
   el.drawerBody.innerHTML = `
     <div class="detail-hero">
-      <div class="detail-cover"><img src="${esc(album.cover)}" alt="" onerror="this.style.display='none'" /></div>
+      <div class="detail-cover"><img src="${esc(withToken(album.cover))}" alt="" onerror="this.style.display='none'" /></div>
       <div class="detail-meta">
         <h2 class="detail-title">${esc(album.name)}</h2>
         <p class="detail-author">${esc((album.authors || []).join(' / ') || '佚名')}</p>
@@ -818,8 +855,22 @@ function trackJob(job) {
       toast(`《${j.title}》PDF 已生成`, 'ok')
     }
   })
+  // 连接层错误浏览器会自动重连；但口令不对、服务重启这类情况会一直失败，
+  // 重连的每个请求都算一次口令错误，几次之后就把自己锁了 —— 失败几次就放弃，
+  // 下次刷新任务列表再重建。
+  let sseFails = 0
+  es.addEventListener('open', () => {
+    sseFails = 0
+  })
   es.addEventListener('error', (ev) => {
-    if (!ev.data) return // 连接层错误，交给浏览器自动重连
+    if (!ev.data) {
+      if (++sseFails >= 3) {
+        es.close()
+        const j = state.jobs.get(job.id)
+        if (j) j.es = null
+      }
+      return
+    }
     onData(ev)
     es.close()
     toast('任务失败，详情见任务列表', 'err')

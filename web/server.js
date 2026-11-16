@@ -138,7 +138,10 @@ async function readJsonBody(req, limit = 1024 * 1024) {
 // 避免公网暴露后被慢慢试出口令。
 const AUTH_MAX_FAIL = 10
 const AUTH_LOCK_MS = 10 * 60 * 1000
-const authFails = new Map() // ip -> { count, until }
+// 同一个 IP 一秒内的并发失败只算一次：一次页面刷新可能同时发出几十个请求，
+// 老口令没换之前，这些请求会在一瞬间全部 401，把正常用户自己锁死。
+const AUTH_FAIL_WINDOW = 1000
+const authFails = new Map() // ip -> { count, until, last }
 
 function clientIp(req) {
   if (options.trustProxy) {
@@ -157,33 +160,59 @@ function tokenEquals(given) {
   return crypto.timingSafeEqual(a, b)
 }
 
-function authLocked(req) {
-  const rec = authFails.get(clientIp(req))
-  return !!(rec?.until && rec.until > Date.now())
-}
-
 function checkToken(req, url) {
   if (!options.token) return true
   const ip = clientIp(req)
-  const rec = authFails.get(ip)
-  if (rec?.until && rec.until > Date.now()) return false
-  if (rec?.until) authFails.delete(ip)
+  // 图片请求带不了 header，所以 query 参数优先；两处都取不到才算没带口令
+  const given = String(req.headers['x-token'] || url.searchParams.get('token') || '')
 
-  const given = req.headers['x-token'] || url.searchParams.get('token') || ''
+  // 先比对再判锁：口令正确就放行并清掉记录。
+  // 否则一旦被误锁（比如浏览器缓存了旧口令、图片漏带 token 刷出十条 401），
+  // 即使后来输对了口令也要干等十分钟 —— 知道口令的人本来就该放行。
   if (given && tokenEquals(given)) {
     authFails.delete(ip)
     return true
   }
 
-  const next = authFails.get(ip) || { count: 0, until: 0 }
+  const rec = authFails.get(ip)
+  if (rec?.until && rec.until > Date.now()) return false
+  if (rec?.until) authFails.delete(ip)
+
+  // 完全没带口令：返回 401，但不计入爆破次数。
+  // 封面、页图这类 <img> 请求漏拼一次 token，就能在几百毫秒内刷出几十条 401；
+  // 之前正是这样把本机和手机一起锁了 10 分钟。
+  if (!given) return false
+
+  const now = Date.now()
+  const next = rec && !rec.until ? rec : { count: 0, until: 0, last: 0 }
+  if (now - (next.last || 0) < AUTH_FAIL_WINDOW) {
+    authFails.set(ip, next)
+    return false
+  }
+
+  next.last = now
   next.count += 1
   if (next.count >= AUTH_MAX_FAIL) {
     next.count = 0
-    next.until = Date.now() + AUTH_LOCK_MS
+    next.until = now + AUTH_LOCK_MS
     console.warn(`[auth] ${ip} 口令连续错误 ${AUTH_MAX_FAIL} 次，已锁定 10 分钟`)
   }
   authFails.set(ip, next)
   return false
+}
+
+/** 锁定剩余秒数；没锁返回 0。 */
+function authLockLeft(req) {
+  const rec = authFails.get(clientIp(req))
+  return rec?.until && rec.until > Date.now() ? Math.ceil((rec.until - Date.now()) / 1000) : 0
+}
+
+/** 封面地址：带上当前请求的口令，否则 <img> 请求会 401 并连累整个 IP。 */
+function coverUrl(url, id, ver) {
+  const q = new URLSearchParams({ id: String(id), v: String(ver || 0) })
+  const token = url.searchParams.get('token')
+  if (token) q.set('token', token)
+  return `/api/cover?${q.toString()}`
 }
 
 /** 校验 JM 号，避免把任意字符串拼进接口。 */
@@ -226,7 +255,7 @@ async function handleSearch(url, res) {
     id: it.id,
     name: it.name,
     author: it.author || '',
-    cover: `/api/cover?id=${encodeURIComponent(it.id)}&v=${it.updateAt || 0}`,
+    cover: coverUrl(url, it.id, it.updateAt),
   }))
 
   sendJson(res, 200, {
@@ -268,7 +297,7 @@ async function handleAlbum(url, res) {
       totalPhotos: d.totalPhotos,
       likes: d.likes,
       addtime: d.addtime,
-      cover: `/api/cover?id=${encodeURIComponent(d.id)}&v=${d.addtime || 0}`,
+      cover: coverUrl(url, d.id, d.addtime),
       series: series.map((s) => ({
         id: s.id,
         sort: s.sort,
@@ -563,7 +592,7 @@ async function handleRead(url, res) {
       id: detail.id,
       name: detail.name,
       authors: detail.authors,
-      cover: `/api/cover?id=${encodeURIComponent(detail.id)}&v=${detail.addtime || 0}`,
+      cover: coverUrl(url, detail.id, detail.addtime),
     },
     chapter: {
       id: info.id,
@@ -927,7 +956,11 @@ async function handleProxyTest(req, res) {
 
 async function handleApi(req, res, url) {
   if (!checkToken(req, url)) {
-    if (authLocked(req)) return sendError(res, 429, '口令错误次数过多，请 10 分钟后再试')
+    const left = authLockLeft(req)
+    if (left > 0) {
+      res.setHeader('Retry-After', String(left))
+      return sendError(res, 429, `口令错误次数过多，已临时锁定，约 ${Math.max(1, Math.ceil(left / 60))} 分钟后恢复`)
+    }
     return sendError(res, 401, '需要访问口令')
   }
 
