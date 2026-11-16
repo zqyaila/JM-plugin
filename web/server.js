@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url'
 
 import JmClient from '../apps/jmcore.js'
 import JmRepository from '../apps/jm.js'
-import { getCachedPdf, listCache, removeCachedPdf } from '../apps/store.js'
+import { getCachedPdf, listCache, removeCachedPdf, PDF_DIR } from '../apps/store.js'
 import { proxyRequest, testProxy, parseProxyList, maskProxy } from '../apps/proxy.js'
 import { config, loadConfig, saveConfig, publicConfig, resolveServerOptions } from './config.js'
 import { createJobManager } from './jobs.js'
@@ -329,26 +329,16 @@ async function handleCreateJob(req, res) {
   sendJson(res, 200, { ok: true, job })
 }
 
-async function handleDownload(url, req, res) {
-  const id = url.pathname.split('/')[3]
-  const job = jobs.get(id)
-  if (!job) return sendError(res, 404, '任务不存在或已过期')
-  if (job.status !== 'done') return sendError(res, 409, '任务尚未完成')
-
-  const cached = await getCachedPdf(job.albumId, job.chapter)
-  if (!cached) return sendError(res, 410, 'PDF 文件已被清理，请重新生成')
-
-  const stat_ = await stat(cached.file)
-  const fileName = `${fileSafeName(job.title)}_JM${job.albumId}${job.chapter ? `_第${job.chapter}章` : ''}.pdf`
-  const encoded = encodeURIComponent(fileName).replace(
+/** 发送 PDF 文件，支持 Range 续传；job 下载与缓存下载共用。 */
+async function sendPdfFile(req, res, file, utf8Name, asciiName) {
+  const size = (await stat(file)).size
+  const encoded = encodeURIComponent(utf8Name).replace(
     /[!'()*]/g,
     (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
   )
-
-  const size = stat_.size
   const headers = {
     'Content-Type': 'application/pdf',
-    'Content-Disposition': `attachment; filename="JM${job.albumId}.pdf"; filename*=UTF-8''${encoded}`,
+    'Content-Disposition': `attachment; filename="${asciiName}"; filename*=UTF-8''${encoded}`,
     'Cache-Control': 'no-store',
     'Accept-Ranges': 'bytes',
   }
@@ -371,12 +361,51 @@ async function handleDownload(url, req, res) {
         'Content-Range': `bytes ${start}-${end}/${size}`,
         'Content-Length': end - start + 1,
       })
-      return fs.createReadStream(cached.file, { start, end }).pipe(res)
+      return fs.createReadStream(file, { start, end }).pipe(res)
     }
   }
 
   res.writeHead(200, { ...headers, 'Content-Length': size })
-  fs.createReadStream(cached.file).pipe(res)
+  fs.createReadStream(file).pipe(res)
+}
+
+function pdfName(name, id, chapter) {
+  return `${fileSafeName(name || `JM${id}`)}_JM${id}${chapter != null ? `_第${chapter}章` : ''}.pdf`
+}
+
+async function handleDownload(url, req, res) {
+  const id = url.pathname.split('/')[3]
+  const job = jobs.get(id)
+  if (!job) return sendError(res, 404, '任务不存在或已过期')
+  if (job.status !== 'done') return sendError(res, 409, '任务尚未完成')
+
+  const cached = await getCachedPdf(job.albumId, job.chapter)
+  if (!cached) return sendError(res, 410, 'PDF 文件已被清理，请重新生成')
+
+  return sendPdfFile(
+    req,
+    res,
+    cached.file,
+    pdfName(job.title, job.albumId, job.chapter),
+    `JM${job.albumId}.pdf`,
+  )
+}
+
+/** 直接下载本地缓存：任务列表因重启丢失后，仍能从缓存里把 PDF 取走。 */
+async function handleCacheDownload(req, res, key) {
+  const list = await listCache()
+  const meta = list.find((it) => it.file === `${key}.pdf`)
+  if (!meta) return sendError(res, 404, '缓存不存在')
+  const file = path.join(PDF_DIR, meta.file)
+  if (!fs.existsSync(file)) return sendError(res, 410, 'PDF 文件已被清理')
+
+  return sendPdfFile(
+    req,
+    res,
+    file,
+    pdfName(meta.name, meta.id, meta.chapter),
+    `JM${meta.id}.pdf`,
+  )
 }
 
 function handleJobEvents(url, req, res) {
@@ -493,6 +522,7 @@ async function handleApi(req, res, url) {
         total: list.length,
         size: list.reduce((s, it) => s + (it.size || 0), 0),
         items: list.map((it) => ({
+          key: String(it.file || '').replace(/\.pdf$/, ''),
           id: it.id,
           chapter: it.chapter,
           name: it.name || `JM${it.id}`,
@@ -501,6 +531,10 @@ async function handleApi(req, res, url) {
           time: it.time || 0,
         })),
       })
+    }
+    if (method === 'GET' && p.startsWith('/cache/') && p.endsWith('/download')) {
+      const key = decodeURIComponent(p.split('/')[2] || '')
+      return await handleCacheDownload(req, res, key)
     }
     if (method === 'DELETE' && p.startsWith('/cache/')) {
       const seg = p.split('/').filter(Boolean) // ['cache', id]

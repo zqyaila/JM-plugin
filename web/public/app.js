@@ -71,6 +71,8 @@ const state = {
   password: '',
   config: null,
   jobs: new Map(),
+  cacheItems: [],
+  cacheSig: '',
   seq: 0,
 }
 
@@ -585,53 +587,74 @@ function updateJob(snapshot) {
 
 function renderJobs() {
   const jobs = [...state.jobs.values()].sort((a, b) => b.createdAt - a.createdAt)
+  const cacheItems = (state.cacheItems || []).slice(0, 20)
+  const html = []
 
-  if (!jobs.length) {
-    el.tasksBody.innerHTML = `<div class="empty" style="padding:34px 18px"><p>还没有任务</p></div>`
-    el.taskBadge.hidden = true
-    updateStats()
-    return
+  if (jobs.length) {
+    html.push('<div class="job-sec">下载任务</div>')
+    html.push(jobs.map(renderJob).join(''))
+  }
+  if (cacheItems.length) {
+    html.push('<div class="job-sec">本地缓存 · 可直接下载</div>')
+    html.push(cacheItems.map(renderCacheItem).join(''))
   }
 
-  el.tasksBody.innerHTML = jobs
-    .map((j) => {
-      const statusMap = {
-        queued: ['排队中', ''],
-        running: ['下载中', ''],
-        done: ['已完成', 'ok'],
-        error: ['失败', 'err'],
-        canceled: ['已取消', ''],
-      }
-      const [label, cls] = statusMap[j.status] || [j.status, '']
-      const percent = j.status === 'done' ? 100 : j.percent || 0
-      const indeterminate = j.status === 'queued' || (j.status === 'running' && !j.total)
-      const sub =
-        j.status === 'error'
-          ? esc(j.error || j.message || '未知错误')
-          : j.status === 'done'
-            ? `${j.total || j.done || 0} 页 · ${fmtSize(j.size)}${j.cached ? ' · 缓存' : ''}`
-            : esc(j.message || '')
-
-      const action =
-        j.status === 'done'
-          ? `<a class="btn primary" href="/api/jobs/${j.id}/download${state.token ? `?token=${encodeURIComponent(state.token)}` : ''}">下载 PDF</a>`
-          : ''
-
-      return `<div class="job" data-id="${j.id}">
-        <div class="job-top">
-          <div class="job-name" title="${esc(j.title)}">${esc(j.title)}${j.chapter ? ` · 第${j.chapter}章` : ''}</div>
-          <div class="job-state ${cls}">${label}</div>
-        </div>
-        <div class="bar ${indeterminate ? 'indeterminate' : ''}"><i style="width:${percent}%"></i></div>
-        <div class="job-sub">${sub}</div>
-        ${action ? `<div class="job-actions">${action}</div>` : ''}
-      </div>`
-    })
-    .join('')
+  el.tasksBody.innerHTML = html.length
+    ? html.join('')
+    : `<div class="empty" style="padding:34px 18px"><p>还没有任务</p></div>`
 
   const active = jobs.some((j) => j.status === 'queued' || j.status === 'running')
   el.taskBadge.hidden = !active
   updateStats()
+}
+
+function renderJob(j) {
+  const statusMap = {
+    queued: ['排队中', ''],
+    running: ['下载中', ''],
+    done: ['已完成', 'ok'],
+    error: ['失败', 'err'],
+    canceled: ['已取消', ''],
+  }
+  const [label, cls] = statusMap[j.status] || [j.status, '']
+  const percent = j.status === 'done' ? 100 : j.percent || 0
+  const indeterminate = j.status === 'queued' || (j.status === 'running' && !j.total)
+  const sub =
+    j.status === 'error'
+      ? esc(j.error || j.message || '未知错误')
+      : j.status === 'done'
+        ? `${j.total || j.done || 0} 页 · ${fmtSize(j.size)}${j.cached ? ' · 缓存' : ''}`
+        : esc(j.message || '')
+
+  const action =
+    j.status === 'done'
+      ? `<a class="btn primary" href="/api/jobs/${j.id}/download${state.token ? `?token=${encodeURIComponent(state.token)}` : ''}">下载 PDF</a>`
+      : ''
+
+  return `<div class="job" data-id="${j.id}">
+    <div class="job-top">
+      <div class="job-name" title="${esc(j.title)}">${esc(j.title)}${j.chapter ? ` · 第${j.chapter}章` : ''}</div>
+      <div class="job-state ${cls}">${label}</div>
+    </div>
+    <div class="bar ${indeterminate ? 'indeterminate' : ''}"><i style="width:${percent}%"></i></div>
+    <div class="job-sub">${sub}</div>
+    ${action ? `<div class="job-actions">${action}</div>` : ''}
+  </div>`
+}
+
+/** 缓存里的 PDF：任务记录丢了也能直接下载。 */
+function renderCacheItem(it) {
+  const href = `/api/cache/${encodeURIComponent(it.key)}/download${state.token ? `?token=${encodeURIComponent(state.token)}` : ''}`
+  const day = it.time ? new Date(it.time).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) : ''
+  const sub = [it.pageCount ? `${it.pageCount} 页` : '', fmtSize(it.size), day].filter(Boolean).join(' · ')
+  return `<div class="job">
+    <div class="job-top">
+      <div class="job-name" title="${esc(it.name)}">${esc(it.name)}${it.chapter != null ? ` · 第${it.chapter}章` : ''}</div>
+      <div class="job-state ok">已生成</div>
+    </div>
+    <div class="job-sub">${sub}</div>
+    <div class="job-actions"><a class="btn primary" href="${href}">下载 PDF</a></div>
+  </div>`
 }
 
 function updateStats() {
@@ -688,6 +711,13 @@ async function refreshCacheStat() {
   try {
     const data = await api('/api/cache')
     el.statCache.textContent = String(data.total)
+    // 缓存列表变了才重绘，避免轮询时面板闪烁
+    const sig = (data.items || []).map((it) => it.key).join(',')
+    if (sig !== state.cacheSig) {
+      state.cacheSig = sig
+      state.cacheItems = data.items || []
+      renderJobs()
+    }
   } catch {
     el.statCache.textContent = '—'
   }

@@ -127,5 +127,37 @@ export async function removeCachedPdf(id, chapterIdx = null) {
 export async function listCache() {
   await ensureStore()
   const index = await readIndex()
+
+  // 补登记孤儿文件：目录里有、索引里没有（旧版本写盘后进程被中断、或索引被删）。
+  // 没有这一步，这些 PDF 明明躺在硬盘上，界面上却看不到、只能重新生成。
+  let dirty = false
+  let files = []
+  try {
+    files = await fsp.readdir(PDF_DIR)
+  } catch {
+    files = []
+  }
+  for (const f of files) {
+    if (!f.endsWith('.pdf')) continue
+    const key = f.slice(0, -4)
+    if (index[key]) continue
+    const m = /^(\d+)(?:_c(\d+))?$/.exec(key)
+    if (!m) continue
+    try {
+      const st = await fsp.stat(path.join(PDF_DIR, f))
+      if (!st.size) continue
+      index[key] = {
+        id: m[1],
+        chapter: m[2] ? Number(m[2]) : null,
+        file: f,
+        size: st.size,
+        time: st.mtimeMs,
+        recovered: true,
+      }
+      dirty = true
+    } catch {}
+  }
+  if (dirty) await writeIndex(index)
+
   return Object.values(index).sort((a, b) => b.time - a.time)
 }

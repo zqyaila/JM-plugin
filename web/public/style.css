@@ -920,3 +920,14 @@ html.gate-passed .gate { display: none; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* 任务面板里的分区标题 */
+.job-sec {
+  padding: 14px 16px 6px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  color: var(--text-mute);
+  text-transform: uppercase;
+}
+.job-sec:first-child { padding-top: 8px; }
