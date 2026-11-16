@@ -329,7 +329,7 @@ async function handleCreateJob(req, res) {
   sendJson(res, 200, { ok: true, job })
 }
 
-async function handleDownload(url, res) {
+async function handleDownload(url, req, res) {
   const id = url.pathname.split('/')[3]
   const job = jobs.get(id)
   if (!job) return sendError(res, 404, '任务不存在或已过期')
@@ -345,12 +345,37 @@ async function handleDownload(url, res) {
     (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
   )
 
-  res.writeHead(200, {
+  const size = stat_.size
+  const headers = {
     'Content-Type': 'application/pdf',
-    'Content-Length': stat_.size,
     'Content-Disposition': `attachment; filename="JM${job.albumId}.pdf"; filename*=UTF-8''${encoded}`,
     'Cache-Control': 'no-store',
-  })
+    'Accept-Ranges': 'bytes',
+  }
+
+  // 支持 Range：下行中断后浏览器/下载器可以接着续传，不必整个重下
+  const range = req.headers.range
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim())
+    if (m && (m[1] !== '' || m[2] !== '')) {
+      let start = m[1] === '' ? size - Number(m[2]) : Number(m[1])
+      let end = m[2] === '' || m[1] === '' ? size - 1 : Number(m[2])
+      if (!Number.isFinite(start) || start < 0) start = 0
+      end = Math.min(Number.isFinite(end) ? end : size - 1, size - 1)
+      if (start > end || start >= size) {
+        res.writeHead(416, { 'Content-Range': `bytes */${size}`, 'Accept-Ranges': 'bytes' })
+        return res.end()
+      }
+      res.writeHead(206, {
+        ...headers,
+        'Content-Range': `bytes ${start}-${end}/${size}`,
+        'Content-Length': end - start + 1,
+      })
+      return fs.createReadStream(cached.file, { start, end }).pipe(res)
+    }
+  }
+
+  res.writeHead(200, { ...headers, 'Content-Length': size })
   fs.createReadStream(cached.file).pipe(res)
 }
 
@@ -451,7 +476,7 @@ async function handleApi(req, res, url) {
       const parts = p.split('/').filter(Boolean) // ['jobs', id, 'events'|'download']
       const [, id, action] = parts
       if (method === 'GET' && action === 'events') return handleJobEvents(url, req, res)
-      if (method === 'GET' && action === 'download') return await handleDownload(url, res)
+      if (method === 'GET' && action === 'download') return await handleDownload(url, req, res)
       if (method === 'GET' && !action) {
         const job = jobs.get(id)
         return job ? sendJson(res, 200, { ok: true, job }) : sendError(res, 404, '任务不存在')
