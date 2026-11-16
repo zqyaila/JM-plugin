@@ -19,7 +19,7 @@ import { readFile, stat } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 
 import JmClient from '../apps/jmcore.js'
-import JmRepository from '../apps/jm.js'
+import JmRepository, { resolveChapters } from '../apps/jm.js'
 import { getCachedPdf, listCache, removeCachedPdf, PDF_DIR } from '../apps/store.js'
 import { proxyRequest, testProxy, parseProxyList, maskProxy } from '../apps/proxy.js'
 import { config, loadConfig, saveConfig, publicConfig, resolveServerOptions } from './config.js'
@@ -28,6 +28,7 @@ import { createJobManager } from './jobs.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC_DIR = path.join(__dirname, 'public')
 const SERVER_PAGE_SIZE = 80 // 服务端搜索接口固定每页 80 条
+const MERGE_PAGE_LIMIT = 350 // 单个合并 PDF 的页数上限，超过就必须分章
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -373,10 +374,19 @@ async function handleCreateJob(req, res) {
   const id = normalizeAlbumId(body.id)
   if (!id) return sendError(res, 400, 'JM 号不合法')
 
-  const chapter = body.chapter == null || body.chapter === '' ? null : parseInt(body.chapter, 10)
-  if (chapter != null && (!Number.isFinite(chapter) || chapter <= 0)) {
-    return sendError(res, 400, '章节序号不合法')
+  const mode = body.mode === 'zip' ? 'zip' : 'single'
+
+  // 章节范围：from/to 为章节序号（sort）；兼容老的 chapter 参数
+  const toInt = (v) => {
+    if (v == null || v === '') return null
+    const n = parseInt(v, 10)
+    return Number.isFinite(n) && n > 0 ? n : NaN
   }
+  let from = toInt(body.from)
+  let to = toInt(body.to)
+  if (body.chapter != null && body.chapter !== '') from = to = toInt(body.chapter)
+  if (Number.isNaN(from) || Number.isNaN(to)) return sendError(res, 400, '章节序号不合法')
+  if (from != null && to != null && from > to) [from, to] = [to, from]
 
   const encrypt = ['none', 'id', 'custom'].includes(body.encrypt) ? body.encrypt : 'none'
   let password = ''
@@ -390,24 +400,40 @@ async function handleCreateJob(req, res) {
 
   await ensureClient()
 
-  // 先拿详情：既用于文件名，也用于页数上限校验
-  const detail = await repo.getAlbum(id)
-  const series = detail.series.length ? detail.series : [{ id: detail.id, sort: 1, name: detail.name, totalPage: 0 }]
-  const chosen = chapter == null ? series : [series.find((s) => s.sort === chapter) || series[0]]
-  const estimated = chosen.reduce((sum, s) => sum + (Number(s.totalPage) || 0), 0)
+  const range = from == null && to == null ? null : { from, to }
+  const { detail, chapters } = await resolveChapters(repo, id, range)
+  const estimated = chapters.reduce((sum, s) => sum + (Number(s.totalPage) || 0), 0)
+
+  // 整本时把实际首尾章记下来，取消/命名时更直观
+  const whole = from == null && to == null
+  if (whole) {
+    from = chapters[0]?.sort ?? 1
+    to = chapters[chapters.length - 1]?.sort ?? 1
+  }
 
   const maxPages = Number(config.maxPages) || 0
   if (maxPages > 0 && estimated > maxPages) {
     return sendError(
       res,
       400,
-      `该作品约 ${estimated} 页，超过单次上限 ${maxPages} 页，请改为单章下载或调高上限`,
+      `所选范围约 ${estimated} 页，超过上限 ${maxPages} 页，请缩小范围或调高上限`,
+    )
+  }
+
+  if (mode === 'single' && estimated > MERGE_PAGE_LIMIT) {
+    return sendError(
+      res,
+      400,
+      `所选范围约 ${estimated} 页，单个 PDF 上限 ${MERGE_PAGE_LIMIT} 页（再多会撑爆内存）。请改用「每章一个 PDF 打包」，或缩小章节范围。`,
     )
   }
 
   const job = jobs.create({
     albumId: id,
-    chapter,
+    from,
+    to,
+    whole,
+    mode,
     title: detail.name,
     pages: estimated,
     encrypt,
@@ -417,15 +443,15 @@ async function handleCreateJob(req, res) {
   sendJson(res, 200, { ok: true, job })
 }
 
-/** 发送 PDF 文件，支持 Range 续传；job 下载与缓存下载共用。 */
-async function sendPdfFile(req, res, file, utf8Name, asciiName) {
+/** 发送文件，支持 Range 续传；任务下载与缓存下载共用。 */
+async function sendFile(req, res, file, { utf8Name, asciiName, contentType }) {
   const size = (await stat(file)).size
   const encoded = encodeURIComponent(utf8Name).replace(
     /[!'()*]/g,
     (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
   )
   const headers = {
-    'Content-Type': 'application/pdf',
+    'Content-Type': contentType,
     'Content-Disposition': `attachment; filename="${asciiName}"; filename*=UTF-8''${encoded}`,
     'Cache-Control': 'no-store',
     'Accept-Ranges': 'bytes',
@@ -461,22 +487,35 @@ function pdfName(name, id, chapter) {
   return `${fileSafeName(name || `JM${id}`)}_JM${id}${chapter != null ? `_第${chapter}章` : ''}.pdf`
 }
 
+function rangeLabel(from, to) {
+  if (from == null && to == null) return ''
+  if (from === to) return `_第${from}章`
+  return `_第${from}-${to}章`
+}
+
 async function handleDownload(url, req, res) {
   const id = url.pathname.split('/')[3]
-  const job = jobs.get(id)
+  const job = jobs.getRaw(id)
   if (!job) return sendError(res, 404, '任务不存在或已过期')
   if (job.status !== 'done') return sendError(res, 409, '任务尚未完成')
+  if (!job.file || !fs.existsSync(job.file)) return sendError(res, 410, '生成的文件已被清理，请重新生成')
 
-  const cached = await getCachedPdf(job.albumId, job.chapter)
-  if (!cached) return sendError(res, 410, 'PDF 文件已被清理，请重新生成')
+  const rangeText = job.whole ? '' : rangeLabel(job.from, job.to)
+  const base = `${fileSafeName(job.title || `JM${job.albumId}`)}_JM${job.albumId}${rangeText}`
 
-  return sendPdfFile(
-    req,
-    res,
-    cached.file,
-    pdfName(job.title, job.albumId, job.chapter),
-    `JM${job.albumId}.pdf`,
-  )
+  if (job.kind === 'zip') {
+    return sendFile(req, res, job.file, {
+      utf8Name: `${base}${job.whole ? `_全${job.chapterCount || job.files || 0}章` : ''}.zip`,
+      asciiName: `JM${job.albumId}.zip`,
+      contentType: 'application/zip',
+    })
+  }
+
+  return sendFile(req, res, job.file, {
+    utf8Name: `${base}.pdf`,
+    asciiName: `JM${job.albumId}.pdf`,
+    contentType: 'application/pdf',
+  })
 }
 
 /** 直接下载本地缓存：任务列表因重启丢失后，仍能从缓存里把 PDF 取走。 */
@@ -487,13 +526,11 @@ async function handleCacheDownload(req, res, key) {
   const file = path.join(PDF_DIR, meta.file)
   if (!fs.existsSync(file)) return sendError(res, 410, 'PDF 文件已被清理')
 
-  return sendPdfFile(
-    req,
-    res,
-    file,
-    pdfName(meta.name, meta.id, meta.chapter),
-    `JM${meta.id}.pdf`,
-  )
+  return sendFile(req, res, file, {
+    utf8Name: pdfName(meta.name, meta.id, meta.chapter),
+    asciiName: `JM${meta.id}.pdf`,
+    contentType: 'application/pdf',
+  })
 }
 
 function handleJobEvents(url, req, res) {
@@ -614,6 +651,7 @@ async function handleApi(req, res, url) {
           id: it.id,
           chapter: it.chapter,
           name: it.name || `JM${it.id}`,
+          tag: it.tag || '',
           pageCount: it.pageCount || 0,
           size: it.size || 0,
           time: it.time || 0,

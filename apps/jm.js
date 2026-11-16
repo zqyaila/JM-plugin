@@ -444,60 +444,55 @@ async function loadMuhammara() {
 }
 
 /**
- * 把一部漫画（整本或单章）下载、打乱还原并合成为一个**加密 PDF**。
- *
- * 加密采用 PDF 标准安全处理器（Standard Security Handler，RC4/AES-128，PDF 1.7）。
- * 双密码：userPassword 与 ownerPassword 均可打开文档。
- *
- * @param {JmClient} client
- * @param {JmRepository} repo
- * @param {string} albumId 漫画 JM 号
- * @param {number|null} chapterIdx 章节序号（null = 整本）
- * @param {string} userPassword 用户密码（通用密码）
- * @param {string} ownerPassword 所有者密码（作品 id）
- * @param {function} [onProgress] 进度回调 (done, total)
- * @param {object} [opts] 额外选项 { concurrency=4, retries=3, retryDelay=2000, quality=82 }
- * @returns {Promise<{ buf: Buffer, pageCount: number, userPassword: string, ownerPassword: string, name: string }>}
+ * 解析要处理的章节。
+ * @param {null|number|{from:number,to:number}} range null=整本，number=单章，对象=区间
+ * @returns {Promise<{detail:object, series:Array, chapters:Array}>}
  */
-export async function buildComicPdf(client, repo, albumId, chapterIdx = null, userPassword = '', ownerPassword = '', onProgress, opts = {}) {
-  const { concurrency = 4, retries = 3, retryDelay = 2000, quality = 82 } = opts
-  const m = await loadMuhammara()
-  if (!m) throw new Error('未安装 @muhammara/wasm，无法生成 PDF')
-  const sharp = await loadSharp()
-  if (!sharp) throw new Error('未安装 sharp，无法生成 PDF')
-
+export async function resolveChapters(repo, albumId, range = null) {
   const detail = await repo.getAlbum(albumId)
   const series = detail.series.length
     ? detail.series
-    : [{ id: detail.id, name: detail.name, sort: 1 }]
+    : [{ id: detail.id, name: detail.name, sort: 1, totalPage: detail.totalPhotos || 0 }]
 
-  // 确定要处理的章节
   let chapters
-  if (chapterIdx != null) {
-    const ch = series.find((s) => s.sort === chapterIdx) || series[0]
-    chapters = [ch]
-  } else {
+  if (range == null || range === 'all') {
     chapters = series
+  } else if (typeof range === 'number' || typeof range === 'string') {
+    const n = Number(range)
+    chapters = series.filter((s) => s.sort === n)
+  } else {
+    const from = Math.max(1, Number(range.from) || 1)
+    const to = Number(range.to) || series.length
+    const lo = Math.min(from, to)
+    const hi = Math.max(from, to)
+    chapters = series.filter((s) => s.sort >= lo && s.sort <= hi)
   }
+  if (!chapters.length) throw new Error('所选章节不存在')
+  return { detail, series, chapters }
+}
 
-  // 先汇总所有页
-  const allPages = []
-  for (const ch of chapters) {
-    const rd = await repo.comicRead(ch.id)
-    const aid = Number(rd.id) || Number(albumId)
-    for (const p of rd.images) {
-      allPages.push({
-        url: client.imgUrl(p.image),
-        aid,
-        scrambleId: rd.scrambleId,
-        chapterName: ch.name,
-        page: p.page,
-      })
-    }
-  }
-  if (!allPages.length) throw new Error('该漫画没有可下载的页面')
+/** 只收集页面元信息（url 字符串），不碰图片字节，几百页也就几十 KB。 */
+async function pagesOfChapter(client, repo, chapter, albumId) {
+  const rd = await repo.comicRead(chapter.id)
+  const aid = Number(rd.id) || Number(albumId)
+  return (rd.images || []).map((p) => ({
+    url: client.imgUrl(p.image),
+    aid,
+    scrambleId: rd.scrambleId,
+    page: p.page,
+  }))
+}
 
-  // 双密码：两个都能打开文档；但二者不能相同（PDF 规范要求）
+/**
+ * 用一个全新的 writer 把这一批页写成 PDF，写完立刻 end()。
+ *
+ * 这里是 `Aborted()` 的关键修复点：以前整本（可能上千页）共用一个 writer，
+ * 所有页的图片字节在 WASM 线性内存里一直累积到 end() 才释放，中途就撑爆了。
+ * 现在每章（或每 350 页）单独建文档、单独落盘，内存只与这一批的页数有关。
+ */
+async function writePdf(client, m, sharp, pages, opts) {
+  const { concurrency = 4, retries = 3, retryDelay = 2000, quality = 82, userPassword = '', ownerPassword = '', onPage } = opts
+
   const up = userPassword || ''
   const op = ownerPassword || ''
   const ownerFinal = op && op !== up ? op : (op || up) + '::jmreader-owner'
@@ -508,17 +503,12 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
     version: m.ePDFVersion17,
   })
 
-  // 阶段一：按页序「下载 → 压缩 → 写入」流水线推进。
-  // 不能先把整本图片下完再写：几百页会同时占着「全部原图 + WASM 里的 PDF + 成品副本」，
-  // WASM 线性内存撑不住会直接 Aborted()。这里用滑动窗口，内存里最多留 concurrency 张图。
-  const total = allPages.length
-  if (onProgress) onProgress(0, total)
-
+  const total = pages.length
   const windowSize = Math.max(1, Math.min(concurrency, total))
   const inflight = new Map()
 
   const openPage = (i) => {
-    const pg = allPages[i]
+    const pg = pages[i]
     return fetchPageImageRetry(client, pg.url, pg.aid, pg.scrambleId, { retries, retryDelay })
       .then((r) => ({ ok: true, r }))
       .catch((error) => ({ ok: false, error }))
@@ -531,7 +521,6 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
     inflight.delete(i)
     if (!slot.ok) throw slot.error
 
-    // 立刻补位，让下载在写 PDF 的同时继续跑
     const nextIdx = i + windowSize
     if (nextIdx < total) inflight.set(nextIdx, openPage(nextIdx))
 
@@ -557,41 +546,122 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
     ctx.drawImage(0, 0, jpeg, { transformation: { width, height } })
     writer.writePage(page)
 
-    if (onProgress) onProgress(i + 1, total)
+    if (onPage) onPage(i + 1, total)
   }
 
   const bytes = writer.end()
+  return { buf: Buffer.from(bytes), pageCount: total, userPassword: up, ownerPassword: op }
+}
+
+/** 加载 WASM 与 sharp（模块级缓存，多次调用只有第一次真的初始化）。 */
+async function prepare() {
+  const m = await loadMuhammara()
+  if (!m) throw new Error('未安装 @muhammara/wasm，无法生成 PDF')
+  const sharp = await loadSharp()
+  if (!sharp) throw new Error('未安装 sharp，无法生成 PDF')
+  return { m, sharp }
+}
+
+/**
+ * 把「一章」写成 PDF。单章页数超过 maxPagesPerFile 时自动分卷，
+ * 保证任何单个文档都不会把 WASM 堆撑爆（这是 Aborted() 的根治手段）。
+ *
+ * @param {object} chapter { id, sort, name }
+ * @param {object} opts { userPassword, ownerPassword, quality, concurrency, retries, retryDelay, maxPagesPerFile }
+ * @param {object} hooks { onProgress(doneInChunk,totalInChunk) }
+ * @returns {Promise<Array<{sort:number,part:number,parts:number,name:string,buf:Buffer,pageCount:number}>>}
+ */
+export async function buildChapterPdf(client, repo, albumId, chapter, opts = {}, hooks = {}) {
+  const { m, sharp } = await prepare()
+  const {
+    concurrency = 4,
+    retries = 3,
+    retryDelay = 2000,
+    quality = 82,
+    maxPagesPerFile = 350,
+  } = opts
+
+  const pages = await pagesOfChapter(client, repo, chapter, albumId)
+  const parts = []
+  if (!pages.length) return parts
+
+  const chunkCount = Math.ceil(pages.length / maxPagesPerFile)
+  for (let i = 0; i < chunkCount; i++) {
+    const chunk = pages.slice(i * maxPagesPerFile, (i + 1) * maxPagesPerFile)
+    const res = await writePdf(client, m, sharp, chunk, {
+      concurrency,
+      retries,
+      retryDelay,
+      quality,
+      userPassword: opts.userPassword || '',
+      ownerPassword: opts.ownerPassword || '',
+      onPage: (n, t) => hooks.onProgress?.(n, t, i + 1, chunkCount),
+    })
+    parts.push({
+      sort: chapter.sort,
+      part: i + 1,
+      parts: chunkCount,
+      name: chapter.name,
+      buf: res.buf,
+      pageCount: res.pageCount,
+      userPassword: res.userPassword,
+      ownerPassword: res.ownerPassword,
+    })
+  }
+  return parts
+}
+
+/**
+ * 把一部漫画（整本 / 单章 / 章节区间）合成为**一个**加密 PDF（兼容旧接口）。
+ *
+ * @param {number|null|{from:number,to:number}} chapterIdx 章节范围
+ */
+export async function buildComicPdf(client, repo, albumId, chapterIdx = null, userPassword = '', ownerPassword = '', onProgress, opts = {}) {
+  const { concurrency = 4, retries = 3, retryDelay = 2000, quality = 82, maxPagesPerFile = 350 } = opts
+  const { m, sharp } = await prepare()
+
+  const { detail, chapters } = await resolveChapters(repo, albumId, chapterIdx)
+
+  const allPages = []
+  for (const ch of chapters) {
+    allPages.push(...(await pagesOfChapter(client, repo, ch, albumId)))
+  }
+  if (!allPages.length) throw new Error('该漫画没有可下载的页面')
+
+  if (allPages.length > maxPagesPerFile) {
+    throw new Error(
+      `本次要合并 ${allPages.length} 页，超过单个 PDF 的安全上限（${maxPagesPerFile} 页）。` +
+        '请改用「每章一个 PDF 打包」，或缩小章节范围。',
+    )
+  }
+
+  if (onProgress) onProgress(0, allPages.length)
+  const res = await writePdf(client, m, sharp, allPages, {
+    concurrency,
+    retries,
+    retryDelay,
+    quality,
+    userPassword,
+    ownerPassword,
+    onPage: (n, t) => onProgress?.(n, t),
+  })
+
   return {
-    buf: Buffer.from(bytes),
-    pageCount: allPages.length,
-    userPassword: up,
-    ownerPassword: op,
+    buf: res.buf,
+    pageCount: res.pageCount,
+    userPassword: res.userPassword,
+    ownerPassword: res.ownerPassword,
     name: detail.name || `JM${albumId}`,
   }
 }
 
 /**
- * 统计一部漫画（整本或单章）的总页数，用于预计下载时间。
- * @returns {Promise<number>}
+ * 统计页数（整本 / 单章 / 区间）。用章节元信息里的 total_page 求和，避免逐章请求。
+ * @param {null|number|{from:number,to:number}} range
  */
-export async function countComicPages(repo, albumId, chapterIdx = null) {
-  const detail = await repo.getAlbum(albumId)
-  const series = detail.series.length
-    ? detail.series
-    : [{ id: detail.id, name: detail.name, sort: 1 }]
-  let chapters
-  if (chapterIdx != null) {
-    const ch = series.find((s) => s.sort === chapterIdx) || series[0]
-    chapters = [ch]
-  } else {
-    chapters = series
-  }
-  let total = 0
-  for (const ch of chapters) {
-    const rd = await repo.comicRead(ch.id)
-    total += rd.images.length || rd.totalPage || 0
-  }
-  return total
+export async function countComicPages(repo, albumId, range = null) {
+  const { chapters } = await resolveChapters(repo, albumId, range)
+  return chapters.reduce((sum, c) => sum + (Number(c.totalPage) || 0), 0)
 }
 
 export default JmRepository

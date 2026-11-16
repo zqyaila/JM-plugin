@@ -100,7 +100,9 @@ const state = {
   page: 1,
   totalPages: 1,
   album: null,
-  chapter: null,
+  from: 1,
+  to: 1,
+  split: 'single',
   encrypt: 'none',
   password: '',
   config: null,
@@ -437,7 +439,10 @@ async function openDetail(id) {
   try {
     const { album } = await api(`/api/album?id=${encodeURIComponent(id)}`, { timeout: 30000 })
     state.album = album
-    state.chapter = null
+    // 默认整本；多章默认分章打包（大作品合并成一个 PDF 容易崩）
+    state.from = album.series[0]?.sort ?? 1
+    state.to = album.series[album.series.length - 1]?.sort ?? 1
+    state.split = album.series.length > 1 ? 'zip' : 'single'
     state.encrypt = state.config?.encrypt || 'none'
     state.password = state.config?.password || ''
     renderDetail(album)
@@ -458,11 +463,10 @@ function renderDetail(album) {
     .filter(Boolean)
     .join('')
 
-  const chapters = album.series
+  const chapterOptions = album.series
     .map(
-      (s) => `<button class="chapter" data-sort="${s.sort}" data-name="${esc(s.name)}">
-        ${chapterCount > 1 ? `${s.sort}. ` : ''}${esc(s.name)}${s.totalPage ? `<small style="opacity:.55"> · ${s.totalPage}P</small>` : ''}
-      </button>`,
+      (s) =>
+        `<option value="${s.sort}">第${s.sort}章 · ${esc(s.name)}${s.totalPage ? ` (${s.totalPage}P)` : ''}</option>`,
     )
     .join('')
 
@@ -486,9 +490,29 @@ function renderDetail(album) {
 
     <div class="section">
       <h3 class="section-title">下载范围 <span id="range-hint">整本</span></h3>
-      <div class="chapter-list" id="chapters">
-        <button class="chapter active" data-sort="all">整本（${chapterCount} 章）</button>
-        ${chapters}
+      <div class="range-row">
+        <label class="range-field">
+          <span>从</span>
+          <select id="ch-from">${chapterOptions}</select>
+        </label>
+        <label class="range-field">
+          <span>到</span>
+          <select id="ch-to">${chapterOptions}</select>
+        </label>
+      </div>
+    </div>
+
+    <div class="section">
+      <h3 class="section-title">输出方式</h3>
+      <div class="radio-group" id="split-group">
+        <label class="radio ${state.split === 'zip' ? 'checked' : ''}">
+          <input type="radio" name="split" value="zip" ${state.split === 'zip' ? 'checked' : ''} />
+          <span>每章一个 PDF，打包 ZIP <small>同一作品一个文件夹，按章节顺序编号</small></span>
+        </label>
+        <label class="radio ${state.split === 'single' ? 'checked' : ''}">
+          <input type="radio" name="split" value="single" ${state.split === 'single' ? 'checked' : ''} />
+          <span>合并成一个 PDF <small>单文件上限 350 页</small></span>
+        </label>
       </div>
     </div>
 
@@ -514,18 +538,38 @@ function renderDetail(album) {
     </div>
 
     <div class="drawer-foot">
-      <div class="summary" id="job-summary">整本 · 约 ${album.totalPages || '?'} 页</div>
-      <button class="btn primary" id="btn-build">生成 PDF</button>
+      <div class="summary" id="job-summary">整本</div>
+      <button class="btn primary" id="btn-build">开始生成</button>
     </div>`
 
-  // 章节选择
-  const list = $('#chapters', el.drawerBody)
-  list.addEventListener('click', (e) => {
-    const btn = e.target.closest('.chapter')
-    if (!btn) return
-    $$('.chapter', list).forEach((n) => n.classList.remove('active'))
-    btn.classList.add('active')
-    state.chapter = btn.dataset.sort === 'all' ? null : Number(btn.dataset.sort)
+  // 章节范围：两个下拉，互相钳制，保证 from <= to
+  const fromSel = $('#ch-from', el.drawerBody)
+  const toSel = $('#ch-to', el.drawerBody)
+  fromSel.value = String(state.from)
+  toSel.value = String(state.to)
+  fromSel.addEventListener('change', () => {
+    state.from = Number(fromSel.value)
+    if (state.from > state.to) {
+      state.to = state.from
+      toSel.value = String(state.to)
+    }
+    updateSummary()
+  })
+  toSel.addEventListener('change', () => {
+    state.to = Number(toSel.value)
+    if (state.to < state.from) {
+      state.from = state.to
+      fromSel.value = String(state.from)
+    }
+    updateSummary()
+  })
+
+  // 输出方式
+  const splitGroup = $('#split-group', el.drawerBody)
+  splitGroup.addEventListener('change', (e) => {
+    if (e.target.name !== 'split') return
+    state.split = e.target.value
+    $$('.radio', splitGroup).forEach((n) => n.classList.toggle('checked', $('input', n).checked))
     updateSummary()
   })
 
@@ -556,18 +600,55 @@ function renderDetail(album) {
   updateSummary()
 }
 
+/** 当前选中的章节列表（按 sort 升序）。 */
+function selectedChapters() {
+  const album = state.album
+  if (!album) return []
+  return album.series.filter((s) => s.sort >= state.from && s.sort <= state.to)
+}
+
+const MERGE_LIMIT = 350
+
 function updateSummary() {
   const album = state.album
   if (!album) return
   const node = $('#job-summary', el.drawerBody)
   if (!node) return
+
+  const list = selectedChapters()
+  const pages = list.reduce((n, s) => n + (Number(s.totalPage) || 0), 0)
+  const whole = list.length === album.series.length
   const rangeLabel =
-    state.chapter == null
-      ? `整本（${album.series.length} 章，约 ${album.totalPages || '?'} 页）`
-      : (() => {
-          const s = album.series.find((x) => x.sort === state.chapter)
-          return s ? `第 ${s.sort} 章 · ${s.name}` : '单章'
-        })()
+    list.length === 1
+      ? `第 ${list[0].sort} 章 · ${list[0].name}`
+      : whole
+        ? `整本（${list.length} 章）`
+        : `第 ${state.from}–${state.to} 章（${list.length} 章）`
+
+  // 合并模式超过上限就禁用，并自动切到分章，避免用户点了才发现失败
+  const singleRadio = $(`input[name="split"][value="single"]`, el.drawerBody)
+  const tooMany = pages > MERGE_LIMIT
+  if (singleRadio) {
+    singleRadio.disabled = tooMany
+    if (tooMany && state.split === 'single') {
+      state.split = 'zip'
+      $('input[name="split"][value="zip"]', el.drawerBody).checked = true
+      $$('.radio', $('#split-group', el.drawerBody)).forEach((n) =>
+        n.classList.toggle('checked', $('input', n).checked),
+      )
+    }
+  }
+
+  const modeText =
+    state.split === 'zip'
+      ? `${list.length} 个 PDF · ZIP 打包`
+      : tooMany
+        ? `超过 ${MERGE_LIMIT} 页，请改用分章`
+        : '1 个 PDF'
+
+  const hint = $('#range-hint', el.drawerBody)
+  if (hint) hint.textContent = list.length === 1 ? `第 ${list[0].sort} 章` : `${list.length} 章`
+
   const encLabel =
     state.encrypt === 'none'
       ? '不加密'
@@ -576,7 +657,14 @@ function updateSummary() {
         : state.password
           ? `密码 ${state.password.replace(/./g, '•')}`
           : '自定义密码（待填写）'
-  node.innerHTML = `${esc(rangeLabel)}<br/><span style="opacity:.7">${esc(encLabel)}</span>`
+
+  const pagesText = pages > 0 ? `约 ${pages} 页` : '页数未知'
+  node.innerHTML =
+    `${esc(rangeLabel)} · ${pagesText}<br/>` +
+    `<span style="opacity:.7">${esc(encLabel)} · ${esc(modeText)}</span>`
+
+  const btn = $('#btn-build', el.drawerBody)
+  if (btn) btn.disabled = tooMany && state.split === 'single'
 }
 
 el.drawerClose.addEventListener('click', closeDrawer)
@@ -611,7 +699,9 @@ async function startJob() {
       timeout: 60000, // 服务端要先拿详情校验页数，首个请求可能触发主机发现
       body: {
         id: album.id,
-        chapter: state.chapter,
+        from: state.from,
+        to: state.to,
+        mode: state.split,
         encrypt: state.encrypt,
         password: state.password,
       },
@@ -619,12 +709,12 @@ async function startJob() {
     trackJob(job)
     openTasks()
     closeDrawer()
-    toast('已加入下载队列', 'ok')
+    toast(job.mode === 'zip' ? '已加入队列，将按章打包 ZIP' : '已加入队列，将合并为一个 PDF', 'ok')
   } catch (err) {
     toast(err.message, 'err')
   } finally {
     btn.disabled = false
-    btn.textContent = '生成 PDF'
+    btn.textContent = '开始生成'
   }
 }
 
@@ -694,6 +784,13 @@ function renderJobs() {
   updateStats()
 }
 
+/** 任务标题后缀：第几章 / 第几到第几章。 */
+function rangeSuffix(j) {
+  if (j.whole || (j.from == null && j.to == null)) return ''
+  if (j.from === j.to) return ` · 第${j.from}章`
+  return ` · 第${j.from}-${j.to}章`
+}
+
 function renderJob(j) {
   const statusMap = {
     queued: ['排队中', ''],
@@ -709,17 +806,19 @@ function renderJob(j) {
     j.status === 'error'
       ? esc(j.error || j.message || '未知错误')
       : j.status === 'done'
-        ? `${j.total || j.done || 0} 页 · ${fmtSize(j.size)}${j.cached ? ' · 缓存' : ''}`
+        ? j.kind === 'zip'
+          ? `${j.files || j.chapterCount || 0} 个 PDF · ${fmtSize(j.size)}${j.cached ? ' · 缓存' : ''}`
+          : `${j.total || j.done || 0} 页 · ${fmtSize(j.size)}${j.cached ? ' · 缓存' : ''}`
         : esc(j.message || '')
 
   const action =
     j.status === 'done'
-      ? `<a class="btn primary" href="/api/jobs/${j.id}/download${state.token ? `?token=${encodeURIComponent(state.token)}` : ''}">下载 PDF</a>`
+      ? `<a class="btn primary" href="/api/jobs/${j.id}/download${state.token ? `?token=${encodeURIComponent(state.token)}` : ''}">下载 ${j.kind === 'zip' ? 'ZIP' : 'PDF'}</a>`
       : ''
 
   return `<div class="job" data-id="${j.id}">
     <div class="job-top">
-      <div class="job-name" title="${esc(j.title)}">${esc(j.title)}${j.chapter ? ` · 第${j.chapter}章` : ''}</div>
+      <div class="job-name" title="${esc(j.title)}">${esc(j.title)}${rangeSuffix(j)}</div>
       <div class="job-state ${cls}">${label}</div>
     </div>
     <div class="bar ${indeterminate ? 'indeterminate' : ''}"><i style="width:${percent}%"></i></div>
@@ -733,9 +832,11 @@ function renderCacheItem(it) {
   const href = `/api/cache/${encodeURIComponent(it.key)}/download${state.token ? `?token=${encodeURIComponent(state.token)}` : ''}`
   const day = it.time ? new Date(it.time).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) : ''
   const sub = [it.pageCount ? `${it.pageCount} 页` : '', fmtSize(it.size), day].filter(Boolean).join(' · ')
+  const rtag = /^r(\d+)-(\d+|end)$/.exec(it.tag || '')
+  const rangeText = rtag ? ` · 第${rtag[1]}-${rtag[2] === 'end' ? '末' : rtag[2]}章` : ''
   return `<div class="job">
     <div class="job-top">
-      <div class="job-name" title="${esc(it.name)}">${esc(it.name)}${it.chapter != null ? ` · 第${it.chapter}章` : ''}</div>
+      <div class="job-name" title="${esc(it.name)}">${esc(it.name)}${it.chapter != null ? ` · 第${it.chapter}章` : rangeText}</div>
       <div class="job-state ok">已生成</div>
     </div>
     <div class="job-sub">${sub}</div>

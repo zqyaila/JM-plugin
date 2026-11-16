@@ -538,6 +538,29 @@ body[data-offline='1'] .stat {
 .chapter-list::-webkit-scrollbar { width: 6px; }
 .chapter-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 6px; }
 
+/* 章节范围：从 / 到 两个下拉 */
+.range-row { display: flex; gap: 10px; align-items: flex-end; }
+.range-field { flex: 1; min-width: 0; display: grid; gap: 6px; }
+.range-field > span {
+  font-size: 11px;
+  color: var(--text-mute);
+  letter-spacing: 0.06em;
+}
+.range-field select {
+  width: 100%;
+  padding: 9px 10px;
+  font-size: 12.5px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  appearance: none;
+  text-overflow: ellipsis;
+}
+.range-field select:focus { outline: none; border-color: rgba(255, 77, 109, 0.5); }
+.radio input:disabled + span { opacity: 0.45; }
+.radio:has(input:disabled) { opacity: 0.6; }
+
 .chapter {
   padding: 7px 11px;
   font-size: 12px;

@@ -43,9 +43,11 @@ async function writeIndex(index) {
   await fsp.writeFile(INDEX_FILE, JSON.stringify(index, null, 2), 'utf8')
 }
 
-/** 生成缓存文件名。整本=id，单章=id_c<章节>。 */
+/** 生成缓存文件名。整本=id，单章=id_c<章节>，区间/打包=id_<标签>。 */
 export function cacheKey(id, chapterIdx = null) {
-  return chapterIdx != null ? `${id}_c${chapterIdx}` : `${id}`
+  if (chapterIdx == null) return `${id}`
+  if (typeof chapterIdx === 'number') return `${id}_c${chapterIdx}`
+  return `${id}_${String(chapterIdx).replace(/[^\w-]/g, '')}`
 }
 
 /**
@@ -141,7 +143,7 @@ export async function listCache() {
     if (!f.endsWith('.pdf')) continue
     const key = f.slice(0, -4)
     if (index[key]) continue
-    const m = /^(\d+)(?:_c(\d+))?$/.exec(key)
+    const m = /^(\d+)(?:_c(\d+)|_([a-z][\w-]*))?$/i.exec(key)
     if (!m) continue
     try {
       const st = await fsp.stat(path.join(PDF_DIR, f))
@@ -149,6 +151,7 @@ export async function listCache() {
       index[key] = {
         id: m[1],
         chapter: m[2] ? Number(m[2]) : null,
+        ...(m[3] ? { tag: m[3] } : {}),
         file: f,
         size: st.size,
         time: st.mtimeMs,
