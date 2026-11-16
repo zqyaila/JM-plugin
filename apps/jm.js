@@ -623,17 +623,18 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
   const { detail, chapters } = await resolveChapters(repo, albumId, chapterIdx)
 
   const allPages = []
-  for (const ch of chapters) {
-    allPages.push(...(await pagesOfChapter(client, repo, ch, albumId)))
+  for (let i = 0; i < chapters.length; i++) {
+    allPages.push(...(await pagesOfChapter(client, repo, chapters[i], albumId)))
+    // 边收集边判断：107 章的合集没必要先把三万多页全扫一遍再报错，
+    // 扫到第 2 章就超限时应该立刻告诉用户，而不是让人干等几分钟。
+    if (allPages.length > maxPagesPerFile) {
+      throw new Error(
+        `已扫到第 ${i + 1}/${chapters.length} 章就有 ${allPages.length} 页，超过单个 PDF 上限 ${maxPagesPerFile} 页。` +
+          '请改用「每章一个 PDF 打包」，或缩小章节范围。',
+      )
+    }
   }
   if (!allPages.length) throw new Error('该漫画没有可下载的页面')
-
-  if (allPages.length > maxPagesPerFile) {
-    throw new Error(
-      `本次要合并 ${allPages.length} 页，超过单个 PDF 的安全上限（${maxPagesPerFile} 页）。` +
-        '请改用「每章一个 PDF 打包」，或缩小章节范围。',
-    )
-  }
 
   if (onProgress) onProgress(0, allPages.length)
   const res = await writePdf(client, m, sharp, allPages, {

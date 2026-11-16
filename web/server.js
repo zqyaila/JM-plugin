@@ -29,6 +29,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC_DIR = path.join(__dirname, 'public')
 const SERVER_PAGE_SIZE = 80 // 服务端搜索接口固定每页 80 条
 const MERGE_PAGE_LIMIT = 350 // 单个合并 PDF 的页数上限，超过就必须分章
+const MERGE_CHAPTER_HINT = 4 // 页数未知时，超过这么多章就不建议合并
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -425,6 +426,17 @@ async function handleCreateJob(req, res) {
       res,
       400,
       `所选范围约 ${estimated} 页，单个 PDF 上限 ${MERGE_PAGE_LIMIT} 页（再多会撑爆内存）。请改用「每章一个 PDF 打包」，或缩小章节范围。`,
+    )
+  }
+
+  // 章节元信息里没有 total_page 时 estimated 是 0，上面的上限拦不住。
+  // 这种多章作品合并成一个 PDF 几乎必然超限，直接说清楚，别让用户等十几分钟才看到失败。
+  if (mode === 'single' && estimated === 0 && chapters.length > MERGE_CHAPTER_HINT) {
+    return sendError(
+      res,
+      400,
+      `该作品共 ${chapters.length} 章、页数未知，合并成一个 PDF 很可能超过 ${MERGE_PAGE_LIMIT} 页。` +
+        '请改用「每章一个 PDF 打包」（可一次选中多章），或把范围缩到几章再试。',
     )
   }
 

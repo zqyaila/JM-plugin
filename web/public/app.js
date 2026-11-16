@@ -642,9 +642,11 @@ function updateSummary() {
         ? `整本（${list.length} 章）`
         : `第 ${state.from}–${state.to} 章（${list.length} 章）`
 
-  // 合并模式超过上限就禁用，并自动切到分章，避免用户点了才发现失败
+  // 合并模式超过上限就禁用，并自动切到分章，避免用户点了才发现失败。
+  // 页数为 0 表示章节元信息没给 total_page，多章合并必然超限，同样按「不能合并」处理。
   const singleRadio = $(`input[name="split"][value="single"]`, el.drawerBody)
-  const tooMany = pages > MERGE_LIMIT
+  const unknownHeavy = pages === 0 && list.length > 4
+  const tooMany = pages > MERGE_LIMIT || unknownHeavy
   if (singleRadio) {
     singleRadio.disabled = tooMany
     if (tooMany && state.split === 'single') {
@@ -658,9 +660,11 @@ function updateSummary() {
 
   const modeText =
     state.split === 'zip'
-      ? `${list.length} 个 PDF · ZIP 打包`
+      ? `${list.length} 个 PDF · ZIP 打包${unknownHeavy ? '（已锁定分章）' : ''}`
       : tooMany
-        ? `超过 ${MERGE_LIMIT} 页，请改用分章`
+        ? unknownHeavy
+          ? `${list.length} 章页数未知，请改用分章`
+          : `超过 ${MERGE_LIMIT} 页，请改用分章`
         : '1 个 PDF'
 
   const hint = $('#range-hint', el.drawerBody)
@@ -944,7 +948,9 @@ function renderJob(j) {
       ? esc(j.error || j.message || '未知错误')
       : j.status === 'done'
         ? j.kind === 'zip'
-          ? `${j.files || j.chapterCount || 0} 个 PDF · ${fmtSize(j.size)}${j.cached ? ' · 缓存' : ''}`
+          ? `${j.files || j.chapterCount || 0} 个 PDF · ${fmtSize(j.size)}${j.cached ? ' · 缓存' : ''}${
+              j.failedChapters?.length ? ` · ${j.failedChapters.length} 章失败` : ''
+            }`
           : `${j.total || j.done || 0} 页 · ${fmtSize(j.size)}${j.cached ? ' · 缓存' : ''}`
         : esc(j.message || '')
 

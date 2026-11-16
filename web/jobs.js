@@ -109,6 +109,7 @@ export function createJobManager({ client, repo, getConfig }) {
       chapterCount: job.chapterCount || 0,
       files: job.files || 0,
       kind: job.kind || 'pdf',
+      failedChapters: job.failedChapters || [],
       title: job.title,
       status: job.status,
       done: job.done,
@@ -227,6 +228,7 @@ export function createJobManager({ client, repo, getConfig }) {
     let fileIndex = 0
     let donePages = 0
     let files = 0
+    const failed = []
 
     try {
       await zip.addBuffer(`${folder}/`, null, { directory: true })
@@ -236,74 +238,85 @@ export function createJobManager({ client, repo, getConfig }) {
         const chapterNo = `${ci + 1}/${chapters.length}`
         update(job, { message: `第 ${chapterNo} 章 · 检查缓存` })
 
-        // 命中缓存（同一密码策略）就直接拿去打包，不重复下载
-        const cached = await getCachedPdf(job.albumId, ch.sort)
-        let parts
-        if (cached && (cached.meta?.userPassword ?? '') === userPassword) {
-          parts = [
-            {
-              sort: ch.sort,
-              part: 1,
-              parts: 1,
-              name: ch.name,
-              path: cached.file,
-              pageCount: cached.meta.pageCount || 0,
-            },
-          ]
-          job.cachedChapters = (job.cachedChapters || 0) + 1
-        } else {
-          parts = await buildChapterPdf(
-            client,
-            repo,
-            job.albumId,
-            ch,
-            {
-              userPassword,
-              ownerPassword: job.ownerPassword || '',
-              concurrency: Number(cfg.concurrency) || 4,
-              quality: Number(cfg.quality) || 82,
-              maxPagesPerFile: 350,
-            },
-            {
-              onProgress: (n, t) => {
-                update(
-                  job,
-                  job.byPages
-                    ? {
-                        done: donePages + n,
-                        total: Math.max(job.total, donePages + t),
-                        message: `第 ${chapterNo} 章 · ${n}/${t} 页`,
-                      }
-                    : { message: `第 ${chapterNo} 章 · ${n}/${t} 页` },
-                )
-              },
-            },
-          )
+        try {
 
-          // 单章只有一个分卷时才缓存（多分卷的缓存键会撞车，意义也不大）
-          for (const p of parts) {
-            if (p.parts === 1) {
-              await putCachedPdf(job.albumId, ch.sort, p.buf, {
-                name: p.name,
-                pageCount: p.pageCount,
-                userPassword: p.userPassword,
-                ownerPassword: p.ownerPassword,
-              })
-              p.path = path.join(PDF_DIR, `${cacheKey(job.albumId, ch.sort)}.pdf`)
+          // 命中缓存（同一密码策略）就直接拿去打包，不重复下载
+          const cached = await getCachedPdf(job.albumId, ch.sort)
+          let parts
+          if (cached && (cached.meta?.userPassword ?? '') === userPassword) {
+            parts = [
+              {
+                sort: ch.sort,
+                part: 1,
+                parts: 1,
+                name: ch.name,
+                path: cached.file,
+                pageCount: cached.meta.pageCount || 0,
+              },
+            ]
+            job.cachedChapters = (job.cachedChapters || 0) + 1
+          } else {
+            parts = await buildChapterPdf(
+              client,
+              repo,
+              job.albumId,
+              ch,
+              {
+                userPassword,
+                ownerPassword: job.ownerPassword || '',
+                concurrency: Number(cfg.concurrency) || 4,
+                quality: Number(cfg.quality) || 82,
+                maxPagesPerFile: 350,
+              },
+              {
+                onProgress: (n, t) => {
+                  update(
+                    job,
+                    job.byPages
+                      ? {
+                          done: donePages + n,
+                          total: Math.max(job.total, donePages + t),
+                          message: `第 ${chapterNo} 章 · ${n}/${t} 页`,
+                        }
+                      : { message: `第 ${chapterNo} 章 · ${n}/${t} 页` },
+                  )
+                },
+              },
+            )
+
+            // 单章只有一个分卷时才缓存（多分卷的缓存键会撞车，意义也不大）
+            for (const p of parts) {
+              if (p.parts === 1) {
+                await putCachedPdf(job.albumId, ch.sort, p.buf, {
+                  name: p.name,
+                  pageCount: p.pageCount,
+                  userPassword: p.userPassword,
+                  ownerPassword: p.ownerPassword,
+                })
+                p.path = path.join(PDF_DIR, `${cacheKey(job.albumId, ch.sort)}.pdf`)
+              }
             }
           }
-        }
 
-        for (const p of parts) {
-          fileIndex += 1
-          const suffix = p.parts > 1 ? `_part${p.part}` : ''
-          const entry = `${folder}/${pad(fileIndex)}_第${ch.sort}章${suffix}.pdf`
-          if (p.path) await zip.addFile(entry, p.path)
-          else await zip.addBuffer(entry, p.buf)
-          files += 1
-          donePages += p.pageCount || 0
-          // 立刻释放，别让多章的内存叠在一起
-          if (p.buf) p.buf = null
+          for (const p of parts) {
+            fileIndex += 1
+            const suffix = p.parts > 1 ? `_part${p.part}` : ''
+            const entry = `${folder}/${pad(fileIndex)}_第${ch.sort}章${suffix}.pdf`
+            if (p.path) await zip.addFile(entry, p.path)
+            else await zip.addBuffer(entry, p.buf)
+            files += 1
+            donePages += p.pageCount || 0
+            // 立刻释放，别让多章的内存叠在一起
+            if (p.buf) p.buf = null
+          }
+        } catch (err) {
+          // 单章失败不再毁掉整个任务：记下来跳过，其余章节照常打包。
+          // 超长连载（上百章）里偶发一两章图片 404 太常见，重跑一次要几小时。
+          const msg = err?.serverMessage || err?.message || String(err)
+          failed.push({ sort: ch.sort, message: msg })
+          job.failedChapters = failed.map((f) => f.sort)
+          update(job, { message: `第 ${chapterNo} 章失败，已跳过：${msg}` }, { force: true })
+          continue
         }
 
         update(
@@ -313,6 +326,10 @@ export function createJobManager({ client, repo, getConfig }) {
             : { done: ci + 1, total: chapters.length, files },
           { force: true },
         )
+      }
+
+      if (!files && failed.length) {
+        throw new Error(`全部 ${chapters.length} 章都失败了：${failed[0].message}`)
       }
 
       const meta = await zip.close()
@@ -327,7 +344,9 @@ export function createJobManager({ client, repo, getConfig }) {
         job,
         {
           status: 'done',
-          message: `${chapters.length} 章 · ${files} 个 PDF · 已打包`,
+          message:
+            `${chapters.length} 章 · ${files} 个 PDF · 已打包` +
+            (failed.length ? `（${failed.length} 章失败：第 ${failed.map((f) => f.sort).join('、')} 章）` : ''),
           finishedAt: Date.now(),
         },
         { force: true },
