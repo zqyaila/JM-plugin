@@ -87,7 +87,15 @@ export function createJobManager({ client, repo, getConfig }) {
 
     const cfg = getConfig()
     client.applyProxy({ proxy: cfg.proxy, proxyMode: cfg.proxyMode })
-    if (!client.apiUrl) await client.bootstrap()
+    if (!client.apiUrl) {
+      // 主机发现最坏要摸好几个域名，卡住时任务会一直「正在解析章节…」，这里兜个底
+      await Promise.race([
+        client.bootstrap(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('连接 JM 服务超时：请检查网络或配置代理')), 30000),
+        ),
+      ])
+    }
 
     try {
       // 1. 已生成过且密码策略一致 → 直接复用

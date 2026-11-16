@@ -16,6 +16,9 @@
  */
 
 import crypto from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { proxyRequest, parseProxyList, maskProxy } from './proxy.js'
 
 // ---------------------------------------------------------------------------
@@ -48,6 +51,51 @@ const KNOWN_API_HOSTS = [
 
 // 图片 CDN 兜底
 const DEFAULT_IMG_HOST = 'https://cdn-msp3.jmdanjonproxy.vip'
+
+// 主机发现很贵（要拉 CDN 配置 + 探测多个域名），成功一次就记到磁盘上。
+// 下次启动直接试这个主机，命中就不再跑完整发现流程，首屏搜索从「几十秒」回到「一秒内」。
+const HOST_CACHE_FILE = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'data',
+  'api-host.json',
+)
+
+function readHostCache() {
+  try {
+    const json = JSON.parse(fs.readFileSync(HOST_CACHE_FILE, 'utf8'))
+    return typeof json?.host === 'string' ? json.host : null
+  } catch {
+    return null
+  }
+}
+
+function writeHostCache(host) {
+  try {
+    fs.mkdirSync(path.dirname(HOST_CACHE_FILE), { recursive: true })
+    fs.writeFileSync(HOST_CACHE_FILE, JSON.stringify({ host, time: Date.now() }, null, 2), 'utf8')
+  } catch {
+    /* 缓存写不进去不影响主流程 */
+  }
+}
+
+/** 谁先成功用谁：整体耗时 = 最快那个，而不是所有串行之和。 */
+function firstOf(promises) {
+  return new Promise((resolve) => {
+    let pending = promises.length
+    if (!pending) return resolve(null)
+    for (const p of promises) {
+      Promise.resolve(p)
+        .then((v) => {
+          if (v) resolve(v)
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (--pending === 0) resolve(null)
+        })
+    }
+  })
+}
 
 // ---------------------------------------------------------------------------
 // 加密工具
@@ -244,25 +292,21 @@ export class JmClient {
   // --- 主机发现 ---
 
   async fetchConfig() {
-    for (const u of HOST_URLS) {
-      let text = null
-      try {
-        text = (await getText(u, {}, 15000, this.rotateProxy('api'))).text
-      } catch {
-        continue
-      }
-      if (!text) continue
+    // 两个 CDN 地址并发拉，谁先给出可用配置就用谁（原来串行 15s×N，最坏要等半分钟）
+    const jobs = HOST_URLS.map(async (u) => {
+      const text = (await getText(u, {}, 8000, this.rotateProxy('api'))).text
+      if (!text) return null
       const plain = decryptHostText(text)
-      if (!plain) continue
+      if (!plain) return null
       let json
       try {
         json = JSON.parse(plain)
       } catch {
-        continue
+        return null
       }
-      if (json.Server || json.Setting) return json
-    }
-    return null
+      return json.Server || json.Setting ? json : null
+    })
+    return firstOf(jobs)
   }
 
   candidateHosts(config) {
@@ -290,7 +334,7 @@ export class JmClient {
   }
 
   /** 用 GET /setting 探测某主机是否真正可用（code:200）。 */
-  async probe(host) {
+  async probe(host, timeout = 8000) {
     const time = Math.floor(Date.now() / 1000)
     const url = `https://${host}/setting?app_img_shunt=1&lang=${this.lang}&t=${time}`
     const headers = {
@@ -299,7 +343,7 @@ export class JmClient {
       version: CLIENT_VERSION,
     }
     try {
-      const { text } = await getText(url, headers, 8000, this.rotateProxy('api'))
+      const { text } = await getText(url, headers, timeout, this.rotateProxy('api'))
       let code = -1
       try {
         code = JSON.parse(text).code ?? -1
@@ -310,6 +354,13 @@ export class JmClient {
     } catch {
       return false
     }
+  }
+
+  /** 记住可用主机：内存 + 磁盘双写，下次启动直接复用。 */
+  acceptHost(host) {
+    this.apiUrl = `https://${host}/`
+    writeHostCache(host)
+    return this.apiUrl
   }
 
   /**
@@ -326,10 +377,16 @@ export class JmClient {
       }
     }
 
-    // 优先上次成功的主机
-    if (this.apiUrl) add(JmClient.normalizeHost(this.apiUrl))
+    // 0. 上次成功的主机：单独快速验证一次（3 秒），命中就结束
+    const remembered = this.apiUrl ? JmClient.normalizeHost(this.apiUrl) : readHostCache()
+    if (remembered && (await this.probe(remembered, 3500))) {
+      return this.acceptHost(remembered)
+    }
 
-    // CDN 配置里的主机
+    // 1. 优先上次成功的主机
+    add(remembered)
+
+    // 2. CDN 配置里的主机
     let config = null
     try {
       config = await this.fetchConfig()
@@ -338,23 +395,18 @@ export class JmClient {
     }
     if (config) this.candidateHosts(config).forEach(add)
 
-    // 兜底主机
+    // 3. 兜底主机
     KNOWN_API_HOSTS.forEach(add)
 
     if (candidates.length === 0) throw new Error('无法取得 API 主机')
 
-    // 快速路径：先试第一个，失败再并发探测其余
-    const first = candidates[0]
-    let winner = (await this.probe(first)) ? first : null
-    if (!winner && candidates.length > 1) {
-      const results = await Promise.all(candidates.slice(1).map(async (h) => ((await this.probe(h)) ? h : null)))
-      winner = results.find((h) => h) || null
-    }
+    // 并发探测（最多 8 个），谁先通就用谁：原来是「先串行试第一个，再并发其余」，
+    // 第一个恰好不通时要多等一个 8 秒超时。
+    const winner = await firstOf(
+      candidates.slice(0, 8).map(async (h) => ((await this.probe(h, 6000)) ? h : null)),
+    )
+    if (winner) return this.acceptHost(winner)
 
-    if (winner) {
-      this.apiUrl = `https://${winner}/`
-      return this.apiUrl
-    }
     if (this.apiUrl) return this.apiUrl
     throw new Error('无法取得 API 主机')
   }

@@ -6,6 +6,39 @@
 const $ = (sel, root = document) => root.querySelector(sel)
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)]
 
+/**
+ * localStorage 在「隐私模式 / 禁用站点数据 / 某些内嵌浏览器」下会直接抛异常。
+ * 一旦在模块顶层抛了，整个 app.js 就不再执行 —— 页面表现就是骨架出来了、
+ * 三个统计一直是「–」、点哪儿都没反应。所以所有读写都兜一层。
+ */
+const store = {
+  get(key) {
+    try {
+      return localStorage.getItem(key)
+    } catch {
+      return null
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(key, value)
+    } catch {
+      /* 存不下就算了，不影响本次使用 */
+    }
+  },
+}
+
+// 兜底：脚本出错时给个看得见的提示，而不是让页面静默变成「什么都点不动」
+window.addEventListener('error', (event) => {
+  console.error('[jm] 页面脚本出错', event.error || event.message)
+  const box = document.getElementById('toasts')
+  if (!box) return
+  const node = document.createElement('div')
+  node.className = 'toast err'
+  node.textContent = `页面脚本出错：${event.message || '未知错误'}`
+  box.appendChild(node)
+})
+
 const el = {
   gate: $('#gate'),
   gateOk: $('#gate-ok'),
@@ -57,10 +90,11 @@ const el = {
   statCache: $('#stat-cache'),
   statJobs: $('#stat-jobs'),
   statProxy: $('#stat-proxy'),
+  heroStats: $('#hero-stats'),
 }
 
 const state = {
-  token: localStorage.getItem('jm-token') || '',
+  token: store.get('jm-token') || '',
   authOpen: false,
   query: '',
   page: 1,
@@ -74,6 +108,7 @@ const state = {
   cacheItems: [],
   cacheSig: '',
   seq: 0,
+  slowHint: 0,
 }
 
 // 支持用 ?token=口令 分享直达链接：取一次即存本地，并把地址栏里的口令抹掉，
@@ -83,7 +118,7 @@ const state = {
   const fromUrl = url.searchParams.get('token')
   if (!fromUrl) return
   state.token = fromUrl
-  localStorage.setItem('jm-token', fromUrl)
+  store.set('jm-token', fromUrl)
   url.searchParams.delete('token')
   history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
 })()
@@ -105,28 +140,62 @@ function toast(message, type = '') {
   }, type === 'err' ? 5000 : 2800)
 }
 
-async function api(path, { method = 'GET', body } = {}) {
+// 所有请求都带超时：后端要是卡在主机发现/生成 PDF，界面得给个说法，
+// 而不是让三个统计数字一直停在「–」。
+const DEFAULT_TIMEOUT = 15000
+
+async function api(path, { method = 'GET', body, timeout = DEFAULT_TIMEOUT } = {}) {
   const url = new URL(path, location.origin)
   if (state.token) url.searchParams.set('token', state.token)
-  const res = await fetch(url, {
-    method,
-    headers: {
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-      ...(state.token ? { 'x-token': state.token } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  const data = await res.json().catch(() => ({}))
-  if (res.status === 401) {
-    openAuth()
-    throw new Error('需要访问口令')
+
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeout)
+  try {
+    let res
+    try {
+      res = await fetch(url, {
+        method,
+        headers: {
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+          ...(state.token ? { 'x-token': state.token } : {}),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: ctrl.signal,
+      })
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        throw new Error(`服务器 ${Math.round(timeout / 1000)} 秒没有响应，可能正在生成 PDF 或网络不通`)
+      }
+      throw new Error('连不上后端服务，请确认它还在运行')
+    }
+
+    const data = await res.json().catch(() => ({}))
+    if (res.status === 401) {
+      openAuth()
+      throw new Error('需要访问口令')
+    }
+    if (!res.ok || data.ok === false) throw new Error(data.error || `请求失败（HTTP ${res.status}）`)
+    return data
+  } finally {
+    clearTimeout(timer)
   }
-  if (!res.ok || data.ok === false) throw new Error(data.error || `请求失败（HTTP ${res.status}）`)
-  return data
 }
 
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+
+/** 顶部统计的安全写法：失败时标黄，提示「可以点一下重试」。 */
+function setStat(node, text, tone = '') {
+  if (!node) return
+  node.textContent = text
+  node.classList.toggle('warn', tone === 'warn')
+}
+
+function setProxyStat() {
+  const c = state.config
+  if (!c) return setStat(el.statProxy, '未连接', 'warn')
+  setStat(el.statProxy, c.proxy ? (c.proxyMode === 'off' ? '已禁用' : '代理') : '直连')
+}
 
 const fmtSize = (bytes) => {
   if (!bytes) return '—'
@@ -146,9 +215,9 @@ const fmtNum = (n) => {
 // ---------------------------------------------------------------------------
 
 const GATE_KEY = 'jm-gate-accepted'
-if (localStorage.getItem(GATE_KEY) !== '1') el.gate.hidden = false
+if (store.get(GATE_KEY) !== '1') el.gate.hidden = false
 el.gateOk?.addEventListener('click', () => {
-  localStorage.setItem(GATE_KEY, '1')
+  store.set(GATE_KEY, '1')
   el.gate.hidden = true
   boot()
 })
@@ -191,13 +260,11 @@ async function submitAuth() {
   el.authError.innerHTML = ''
   state.token = value
   try {
-    await api('/api/config') // 只用于校验口令；loadConfig 内部会吞异常，不能用它判断
-    localStorage.setItem('jm-token', value)
+    await api('/api/config', { timeout: 8000 }) // 只用于校验口令
+    store.set('jm-token', value)
     closeAuth()
     toast('口令正确，已保存到本机', 'ok')
-    await loadConfig()
-    await restoreJobs()
-    refreshCacheStat()
+    await warmUp()
   } catch (err) {
     state.token = prev
     // 401 会被 api() 统一成「需要访问口令」，在弹窗里应表述为口令错误；
@@ -272,8 +339,16 @@ async function doSearch(q, page = 1) {
   document.body.classList.add('searching')
   renderSkeletons()
 
+  // 首次搜索要发现镜像主机，慢是正常的；但要让人知道「在等什么」
+  const hint = setTimeout(() => {
+    if (token === state.seq && state.slowHint !== token) {
+      state.slowHint = token
+      toast('正在连接镜像站，首次可能需要 10 秒左右…')
+    }
+  }, 4000)
+
   try {
-    const data = await api(`/api/search?q=${encodeURIComponent(query)}&page=${page}`)
+    const data = await api(`/api/search?q=${encodeURIComponent(query)}&page=${page}`, { timeout: 45000 })
     if (token !== state.seq) return
 
     if (data.redirectAid) {
@@ -297,6 +372,9 @@ async function doSearch(q, page = 1) {
     window.scrollTo({ top: 0, behavior: 'smooth' })
   } catch (err) {
     if (token === state.seq) renderEmpty(err.message)
+  } finally {
+    clearTimeout(hint)
+    if (token === state.seq) document.body.classList.remove('searching')
   }
 }
 
@@ -350,7 +428,7 @@ async function openDetail(id) {
   </div>`
 
   try {
-    const { album } = await api(`/api/album?id=${encodeURIComponent(id)}`)
+    const { album } = await api(`/api/album?id=${encodeURIComponent(id)}`, { timeout: 30000 })
     state.album = album
     state.chapter = null
     state.encrypt = state.config?.encrypt || 'none'
@@ -523,6 +601,7 @@ async function startJob() {
   try {
     const { job } = await api('/api/jobs', {
       method: 'POST',
+      timeout: 60000, // 服务端要先拿详情校验页数，首个请求可能触发主机发现
       body: {
         id: album.id,
         chapter: state.chapter,
@@ -676,50 +755,42 @@ el.btnTasks.addEventListener('click', () => (el.tasks.classList.contains('open')
 el.tasksClose.addEventListener('click', closeTasks)
 
 // 刷新后恢复任务列表
-async function restoreJobs() {
-  try {
-    const { jobs } = await api('/api/jobs')
-    for (const job of jobs) {
-      if (job.status === 'queued' || job.status === 'running') trackJob(job)
-      else state.jobs.set(job.id, job)
-    }
-    renderJobs()
-  } catch {
-    /* 忽略 */
+function applyJobs(list) {
+  for (const job of list) {
+    if (job.status === 'queued' || job.status === 'running') trackJob(job)
+    else state.jobs.set(job.id, job)
   }
+  renderJobs()
 }
 
 // ---------------------------------------------------------------------------
 // 设置
 // ---------------------------------------------------------------------------
 
-async function loadConfig() {
-  try {
-    const { config } = await api('/api/config')
-    state.config = config
-    el.statProxy.textContent = config.proxy ? (config.proxyMode === 'off' ? '已禁用' : '代理') : '直连'
-    el.statCache.textContent = '…'
-    fillSettings(config)
-    refreshCacheStat()
-    return config
-  } catch {
-    return null
+async function loadConfig({ timeout = 8000 } = {}) {
+  const { config } = await api('/api/config', { timeout })
+  state.config = config
+  setProxyStat()
+  fillSettings(config)
+  return config
+}
+
+function applyCache(data) {
+  setStat(el.statCache, String(data.total ?? 0))
+  // 缓存列表变了才重绘，避免轮询时面板闪烁
+  const sig = (data.items || []).map((it) => it.key).join(',')
+  if (sig !== state.cacheSig) {
+    state.cacheSig = sig
+    state.cacheItems = data.items || []
+    renderJobs()
   }
 }
 
 async function refreshCacheStat() {
   try {
-    const data = await api('/api/cache')
-    el.statCache.textContent = String(data.total)
-    // 缓存列表变了才重绘，避免轮询时面板闪烁
-    const sig = (data.items || []).map((it) => it.key).join(',')
-    if (sig !== state.cacheSig) {
-      state.cacheSig = sig
-      state.cacheItems = data.items || []
-      renderJobs()
-    }
+    applyCache(await api('/api/cache', { timeout: 10000 }))
   } catch {
-    el.statCache.textContent = '—'
+    setStat(el.statCache, '—', 'warn')
   }
 }
 
@@ -739,7 +810,9 @@ el.setEncrypt.addEventListener('change', () => {
 })
 
 function openSettings() {
-  loadConfig()
+  loadConfig().catch(() => {
+    /* 配置读不到不影响打开设置面板，只是回显为空 */
+  })
   el.modalScrim.hidden = false
   requestAnimationFrame(() => el.modalScrim.classList.add('show'))
   el.settings.classList.add('open')
@@ -772,9 +845,9 @@ el.settingsSave.addEventListener('click', async () => {
       encrypt: el.setEncrypt.value,
       password: el.setPassword.value,
     }
-    const { config } = await api('/api/config', { method: 'POST', body: payload })
+    const { config } = await api('/api/config', { method: 'POST', body: payload, timeout: 15000 })
     state.config = config
-    el.statProxy.textContent = config.proxy ? (config.proxyMode === 'off' ? '已禁用' : '代理') : '直连'
+    setProxyStat()
     toast('设置已保存', 'ok')
     closeSettings()
   } catch (err) {
@@ -823,20 +896,65 @@ document.addEventListener('keydown', (e) => {
 })
 
 let booted = false
+let refreshTimer = null
+let offlineNotified = false
+
+/**
+ * 一次性把首屏需要的三个接口并行拉回来。
+ * 以前是「先 await 配置，再 await 任务，再请求缓存」，串行三跳，
+ * 只要第一跳卡住，整页就一直空着。
+ */
+async function warmUp() {
+  setStat(el.statCache, '…')
+  setStat(el.statProxy, '…')
+
+  const [cfg, jobRes, cacheRes] = await Promise.allSettled([
+    api('/api/config', { timeout: 6000 }),
+    api('/api/jobs', { timeout: 6000 }),
+    api('/api/cache', { timeout: 8000 }),
+  ])
+
+  if (cfg.status === 'fulfilled') {
+    state.config = cfg.value.config
+    fillSettings(state.config)
+    setProxyStat()
+    delete document.body.dataset.offline
+  } else {
+    setStat(el.statProxy, '未连接', 'warn')
+    document.body.dataset.offline = '1'
+    const msg = cfg.reason?.message || ''
+    // 没带口令时弹窗已经够清楚，不用再弹一条
+    if (!offlineNotified && !/口令/.test(msg)) {
+      offlineNotified = true
+      toast('后端没有响应，点顶部「网络模式」可重试', 'err')
+    }
+  }
+
+  if (jobRes.status === 'fulfilled') applyJobs(jobRes.value.jobs)
+  else setStat(el.statJobs, '—', 'warn')
+  if (cacheRes.status === 'fulfilled') applyCache(cacheRes.value)
+  else setStat(el.statCache, '—', 'warn')
+}
 
 async function boot() {
   if (booted) return
   booted = true
-  try {
-    await loadConfig()
-    await restoreJobs()
-  } catch {
-    // 未带口令或后端暂不可用：口令框由 api() 的 401 分支弹出，这里不打断页面
-  }
+  // 先把界面铺出来，一帧都不等网络：网络慢只影响数字，不影响「能操作」
   renderEmpty('输入关键词或 JM 号开始', true)
-  refreshCacheStat()
-  setInterval(refreshCacheStat, 60000)
+
+  await warmUp()
+
+  if (refreshTimer) clearInterval(refreshTimer)
+  refreshTimer = setInterval(refreshCacheStat, 60000)
 }
+
+// 统计区点一下重连（离线时才会生效）
+el.heroStats?.addEventListener('click', async () => {
+  if (document.body.dataset.offline !== '1') return
+  toast('正在重新连接…')
+  await warmUp()
+  if (document.body.dataset.offline !== '1') toast('已连接', 'ok')
+})
 
 // 已确认过 18+ 才立即初始化，否则等确认后再加载，避免口令框被遮罩挡住
 if (el.gate.hidden) boot()

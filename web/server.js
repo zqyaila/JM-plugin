@@ -13,6 +13,7 @@ import http from 'node:http'
 import crypto from 'node:crypto'
 import path from 'node:path'
 import fs from 'node:fs'
+import { gzipSync } from 'node:zlib'
 import { readFile, stat } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 
@@ -52,6 +53,17 @@ const options = resolveServerOptions()
 
 let bootstrapping = null
 
+/** 给可能长时间无响应的操作套一层超时，避免浏览器那边一直转圈。 */
+function withTimeout(promise, ms, message) {
+  let timer
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms)
+    }),
+  ]).finally(() => clearTimeout(timer))
+}
+
 /** 同步代理配置并确保 API 主机可用（并发调用共享同一次引导）。 */
 async function ensureClient() {
   client.applyProxy({ proxy: config.proxy, proxyMode: config.proxyMode })
@@ -68,7 +80,11 @@ async function ensureClient() {
         bootstrapping = null
       })
   }
-  await bootstrapping
+  await withTimeout(
+    bootstrapping,
+    25000,
+    '连接 JM 服务超时（25 秒）：本机网络可能连不上镜像站，建议在设置里配置代理后重试。',
+  )
 }
 
 function sendJson(res, status, payload) {
@@ -244,18 +260,76 @@ async function handleAlbum(url, res) {
   })
 }
 
+/**
+ * 封面缓存 + 并发闸门。
+ *
+ * 一屏搜索结果有 24 张封面，浏览器对同一域名只有 6 条连接：如果每张封面都要
+ * 现连镜像站（还可能走代理），6 条连接会被慢速图片全部占满，之后的 /api/config、
+ * /api/jobs 只能排队 —— 表现就是「页面半天加载不出来，顶部统计一直是 —」。
+ * 这里做两件事：内存缓存命中直接返回；未命中时限制同时只抓 4 张。
+ */
+const COVER_TTL = 60 * 60 * 1000
+const COVER_MAX_BYTES = 48 * 1024 * 1024
+const COVER_CONCURRENCY = 4
+const coverCache = new Map() // `${id}@${v}` -> { buf, type, time }
+let coverBytes = 0
+let coverBusy = 0
+const coverQueue = []
+
+function takeCoverSlot() {
+  if (coverBusy < COVER_CONCURRENCY) {
+    coverBusy++
+    return Promise.resolve()
+  }
+  return new Promise((resolve) => coverQueue.push(resolve))
+}
+
+function freeCoverSlot() {
+  const next = coverQueue.shift()
+  // 有排队者就直接把名额移交过去，busy 计数保持不变
+  if (next) next()
+  else coverBusy--
+}
+
+function rememberCover(key, buf, type) {
+  if (buf.length > 8 * 1024 * 1024) return
+  const old = coverCache.get(key)
+  if (old) coverBytes -= old.buf.length
+  coverCache.delete(key)
+  coverCache.set(key, { buf, type, time: Date.now() })
+  coverBytes += buf.length
+  while (coverBytes > COVER_MAX_BYTES && coverCache.size > 1) {
+    const [k, v] = coverCache.entries().next().value
+    coverCache.delete(k)
+    coverBytes -= v.buf.length
+  }
+}
+
+function sendCover(res, buf, type, cacheState = 'public, max-age=86400, immutable') {
+  res.writeHead(200, {
+    'Content-Type': type || 'image/jpeg',
+    'Content-Length': buf.length,
+    'Cache-Control': cacheState,
+  })
+  res.end(buf)
+}
+
 /** 封面转发：服务端取图再吐给浏览器，避免防盗链 / 浏览器侧被墙。 */
 async function handleCover(url, res) {
   const id = normalizeAlbumId(url.searchParams.get('id'))
   if (!id) return sendError(res, 400, 'JM 号不合法')
   const v = url.searchParams.get('v') || '0'
+  const key = `${id}@${v}`
 
-  client.applyProxy({ proxy: config.proxy, proxyMode: config.proxyMode })
-  const target = client.comicCover(id, v)
+  const hit = coverCache.get(key)
+  if (hit && Date.now() - hit.time < COVER_TTL) return sendCover(res, hit.buf, hit.type)
 
+  await takeCoverSlot()
   try {
+    client.applyProxy({ proxy: config.proxy, proxyMode: config.proxyMode })
+    const target = client.comicCover(id, v)
     const r = await proxyRequest(target, {
-      timeout: 20000,
+      timeout: 12000,
       proxy: client.proxyFor('image'),
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
@@ -268,15 +342,14 @@ async function handleCover(url, res) {
       res.end('cover not found')
       return
     }
-    res.writeHead(200, {
-      'Content-Type': r.headers['content-type'] || 'image/jpeg',
-      'Content-Length': r.body.length,
-      'Cache-Control': 'public, max-age=86400',
-    })
-    res.end(r.body)
+    const type = r.headers['content-type'] || 'image/jpeg'
+    rememberCover(key, r.body, type)
+    sendCover(res, r.body, type)
   } catch {
     res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
     res.end('cover fetch failed')
+  } finally {
+    freeCoverSlot()
   }
 }
 
@@ -556,7 +629,10 @@ async function handleApi(req, res, url) {
   }
 }
 
-/** 静态资源：带 ETag 协商缓存，避免升级后浏览器仍用旧样式。 */
+/** 文本类静态资源才值得 gzip。 */
+const GZIP_EXT = new Set(['.html', '.js', '.css', '.json', '.svg', '.txt', '.webmanifest'])
+const gzCache = new Map() // etag -> Buffer
+
 async function serveStatic(req, res, url) {
   let pathname = decodeURIComponent(url.pathname)
   if (pathname === '/' || pathname === '') pathname = '/index.html'
@@ -575,20 +651,43 @@ async function serveStatic(req, res, url) {
     return
   }
 
+  // 带 ?v=N 的资源内容变了 URL 才会变，可以放心让浏览器长期强缓存；
+  // 没带版本号的（比如直接敲地址打开的 index.html）保持协商缓存，保证能及时更新。
+  const versioned = url.searchParams.has('v')
+  const cacheControl = versioned ? 'public, max-age=31536000, immutable' : 'no-cache'
+
   try {
     const st = await stat(full)
     const etag = `"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`
     if (req.headers['if-none-match'] === etag) {
-      res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' })
+      res.writeHead(304, { ETag: etag, 'Cache-Control': cacheControl })
       res.end()
       return
     }
-    const data = await readFile(full)
+
+    let data = await readFile(full)
+    let encoding = null
+    if (GZIP_EXT.has(ext) && data.length > 1024 && /\bgzip\b/.test(req.headers['accept-encoding'] || '')) {
+      let gz = gzCache.get(etag)
+      if (!gz) {
+        gz = gzipSync(data, { level: 6 })
+        if (gzCache.size > 32) gzCache.clear()
+        gzCache.set(etag, gz)
+      }
+      // 压不小就别压了（超短文件反而变大）
+      if (gz.length < data.length) {
+        data = gz
+        encoding = 'gzip'
+      }
+    }
+
     res.writeHead(200, {
       'Content-Type': MIME[ext],
       'Content-Length': data.length,
       ETag: etag,
-      'Cache-Control': 'no-cache',
+      'Cache-Control': cacheControl,
+      Vary: 'Accept-Encoding',
+      ...(encoding ? { 'Content-Encoding': encoding } : {}),
     })
     res.end(data)
   } catch {
@@ -607,6 +706,13 @@ async function main() {
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+    const started = Date.now()
+    // 慢请求打日志：下次觉得「卡」的时候，看控制台就知道卡在哪个接口
+    res.on('finish', () => {
+      if (String(res.getHeader('Content-Type') || '').includes('event-stream')) return
+      const ms = Date.now() - started
+      if (ms > 1200) console.log(`[slow] ${req.method} ${url.pathname}${url.search} ${ms}ms`)
+    })
     try {
       if (url.pathname.startsWith('/api/')) {
         await handleApi(req, res, url)
@@ -618,6 +724,11 @@ async function main() {
       else res.end()
     }
   })
+
+  // 默认 keepAliveTimeout 只有 5 秒，浏览器复用一条刚好被服务端关掉的连接时会
+  // 卡住再重试，体感就是「首屏莫名慢 5 秒」。调长到 65 秒避开这个竞态。
+  server.keepAliveTimeout = 65000
+  server.headersTimeout = 70000
 
   server.on('clientError', (err, socket) => {
     if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')

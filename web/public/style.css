@@ -235,9 +235,18 @@ body.searching .hero { display: none; }
   border: 1px solid var(--line);
   border-radius: 13px;
   background: rgba(255, 255, 255, 0.025);
+  transition: border-color 0.2s, background 0.2s;
 }
 .stat b { display: block; font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
 .stat span { font-size: 11px; color: var(--text-mute); }
+
+/* 后端没连上：数字标黄，整块可点重试 */
+.stat b.warn { color: var(--warn); }
+body[data-offline='1'] .hero-stats { cursor: pointer; }
+body[data-offline='1'] .stat {
+  border-color: rgba(255, 182, 72, 0.35);
+  background: rgba(255, 182, 72, 0.06);
+}
 
 /* ---------- 结果区 ---------- */
 
