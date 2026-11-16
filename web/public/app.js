@@ -215,10 +215,17 @@ const fmtNum = (n) => {
 // ---------------------------------------------------------------------------
 
 const GATE_KEY = 'jm-gate-accepted'
-if (store.get(GATE_KEY) !== '1') el.gate.hidden = false
+// 判断「是否已同意」必须看存储，不能看 el.gate.hidden：
+// 刷新后 index.html 头部的内联脚本会给 <html> 加 gate-passed，门禁是被 CSS 隐藏的，
+// DOM 上的 hidden 属性一直是 false —— 之前拿它做判断，导致刷新后 boot() 一次都不执行，
+// 页面永远停在三个「–」上（第一次点「进入」时反而正常，所以很难复现）。
+const gateAccepted = store.get(GATE_KEY) === '1'
+el.gate.hidden = gateAccepted
+
 el.gateOk?.addEventListener('click', () => {
   store.set(GATE_KEY, '1')
   el.gate.hidden = true
+  document.documentElement.classList.add('gate-passed')
   boot()
 })
 el.gateClose?.addEventListener('click', () => {
@@ -956,5 +963,5 @@ el.heroStats?.addEventListener('click', async () => {
   if (document.body.dataset.offline !== '1') toast('已连接', 'ok')
 })
 
-// 已确认过 18+ 才立即初始化，否则等确认后再加载，避免口令框被遮罩挡住
-if (el.gate.hidden) boot()
+// 已确认过 18+ 才立即初始化，否则等点「进入」后再加载，避免口令框被遮罩挡住
+if (gateAccepted) boot()
