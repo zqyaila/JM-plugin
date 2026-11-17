@@ -100,6 +100,9 @@ const el = {
   setConcurrency: $('#set-concurrency'),
   setQuality: $('#set-quality'),
   setMaxPages: $('#set-maxpages'),
+  setPageCache: $('#set-pagecache'),
+  btnClearPages: $('#btn-clear-pages'),
+  pagesStat: $('#pages-stat'),
   setEncrypt: $('#set-encrypt'),
   setPassword: $('#set-password'),
   testProxy: $('#btn-test-proxy'),
@@ -1616,10 +1619,37 @@ function fillSettings(cfg) {
   el.setConcurrency.value = cfg.concurrency ?? 4
   el.setQuality.value = cfg.quality ?? 82
   el.setMaxPages.value = cfg.maxPages ?? 0
+  el.setPageCache.value = cfg.pageCacheMB ?? 512
   el.setEncrypt.value = cfg.encrypt || 'none'
   el.setPassword.value = cfg.password || ''
   el.setPassword.hidden = (cfg.encrypt || 'none') !== 'custom'
 }
+
+async function refreshPagesStat() {
+  try {
+    const data = await api('/api/cache', { timeout: 10000 })
+    const p = data.pages || {}
+    el.pagesStat.textContent = p.files
+      ? `已存 ${p.files} 页 · ${fmtSize(p.size)}${p.limitMB ? ` / 上限 ${p.limitMB} MB` : '（不限）'}`
+      : '还没有缓存任何页'
+  } catch {
+    el.pagesStat.textContent = '—'
+  }
+}
+
+el.btnClearPages.addEventListener('click', async () => {
+  if (!window.confirm('清空所有已缓存的阅读页？下次阅读会重新从图源下载。')) return
+  el.btnClearPages.disabled = true
+  try {
+    const r = await api('/api/cache/pages', { method: 'DELETE', timeout: 30000 })
+    toast(r.removed ? `已清空 ${r.removed} 页（${fmtSize(r.size || 0)}）` : '本来就没有缓存', 'ok')
+    refreshPagesStat()
+  } catch (err) {
+    toast(err.message, 'err')
+  } finally {
+    el.btnClearPages.disabled = false
+  }
+})
 
 el.setEncrypt.addEventListener('change', () => {
   el.setPassword.hidden = el.setEncrypt.value !== 'custom'
@@ -1629,6 +1659,7 @@ function openSettings() {
   loadConfig().catch(() => {
     /* 配置读不到不影响打开设置面板，只是回显为空 */
   })
+  refreshPagesStat()
   el.modalScrim.hidden = false
   requestAnimationFrame(() => el.modalScrim.classList.add('show'))
   el.settings.classList.add('open')
@@ -1658,6 +1689,7 @@ el.settingsSave.addEventListener('click', async () => {
       concurrency: Number(el.setConcurrency.value) || 4,
       quality: Number(el.setQuality.value) || 82,
       maxPages: Number(el.setMaxPages.value) || 0,
+      pageCacheMB: Math.max(0, Number(el.setPageCache.value) || 0),
       encrypt: el.setEncrypt.value,
       password: el.setPassword.value,
     }

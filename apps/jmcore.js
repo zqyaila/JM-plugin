@@ -87,6 +87,15 @@ function writeHostCache(host) {
   }
 }
 
+/** 记住的主机整台挂掉时清掉记忆，下次（或本请求的补救）重新探测。 */
+function clearHostCache() {
+  try {
+    fs.unlinkSync(HOST_CACHE_FILE)
+  } catch {
+    /* 本来就没有 */
+  }
+}
+
 /** 谁先成功用谁：整体耗时 = 最快那个，而不是所有串行之和。 */
 function firstOf(promises) {
   return new Promise((resolve) => {
@@ -431,7 +440,7 @@ export class JmClient {
    * @param {string} path 如 "latest"
    * @param {object} params 查询/表单参数
    */
-  async request(method, path, params = {}) {
+  async request(method, path, params = {}, retryOnNewHost = true) {
     if (!this.apiUrl) await this.bootstrap()
     const base = this.apiUrl.replace(/\/+$/, '')
     const cleanPath = path.replace(/^\/+/, '')
@@ -515,7 +524,7 @@ export class JmClient {
           if (attempt < 2) await new Promise((r) => setTimeout(r, API_POST_BACKOFF))
         }
       }
-      throw new Error(lastErr?.message || '请求失败')
+      return await this.recoverHost(lastErr, method, path, params, retryOnNewHost)
     }
 
     // GET 对冲：按 API_HEDGE_DELAYS 依次起跑，第一个成功的胜出。
@@ -553,7 +562,11 @@ export class JmClient {
               clearTimers()
               launch()
             } else {
-              settle(reject, lastErr)
+              // 三次都失败：如果是 5xx，说明这台主机整台挂了，换一台再来一次
+              this.recoverHost(lastErr, method, path, params, retryOnNewHost).then(
+                (value) => settle(resolve, value),
+                (e) => settle(reject, e),
+              )
             }
           },
         )
@@ -564,6 +577,18 @@ export class JmClient {
         else timers.push(setTimeout(launch, delay))
       })
     })
+  }
+
+  /**
+   * 上游整台主机挂了（全 5xx）时的补救：清掉主机记忆、重新探测，把这次请求重发一遍。
+   * 只补救一次，避免在几台坏主机之间来回打转。
+   */
+  async recoverHost(err, method, path, params, allow) {
+    if (!allow || !(err?.httpStatus >= 500)) throw err
+    this.apiUrl = null
+    clearHostCache()
+    await this.bootstrap()
+    return await this.request(method, path, params, false)
   }
 
   parseResponse(bodyText, url, time, httpStatus) {

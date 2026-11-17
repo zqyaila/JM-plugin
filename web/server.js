@@ -22,8 +22,9 @@ import JmClient from '../apps/jmcore.js'
 import JmRepository, { resolveChapters, chapterPages, fetchPageImageRetry } from '../apps/jm.js'
 import { getCachedPdf, listCache, removeCachedPdf, PDF_DIR } from '../apps/store.js'
 import { proxyRequest, testProxy, parseProxyList, maskProxy } from '../apps/proxy.js'
-import { config, loadConfig, saveConfig, publicConfig, resolveServerOptions } from './config.js'
+import { config, loadConfig, saveConfig, publicConfig, resolveServerOptions, DATA_DIR } from './config.js'
 import { createJobManager } from './jobs.js'
+import { createPageStore } from './pagecache.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC_DIR = path.join(__dirname, 'public')
@@ -426,6 +427,11 @@ const seriesCache = new Map() // albumId -> { detail, time }
 
 const PAGE_TTL = 2 * 60 * 60 * 1000
 const PAGE_CACHE_MAX = 192 * 1024 * 1024
+// 内存只是一层热缓存；真正让「看过的页不用再下」的是磁盘这份，见 web/pagecache.js
+const pageStore = createPageStore({
+  dir: path.join(DATA_DIR, 'pages'),
+  limitMB: config.pageCacheMB,
+})
 const pageCache = new Map() // `${chapterId}:${p}` -> { buf, type, etag, time }
 let pageCacheBytes = 0
 
@@ -569,6 +575,10 @@ async function handleRead(url, res) {
     dims: (fresh && prev.dims) || {},
     time: Date.now(),
   }
+  // 重启后内存里的尺寸没了，磁盘索引还记着：补上，首屏才能按真实比例占位
+  if (!Object.keys(meta.dims).length) {
+    meta.dims = await pageStore.dims(String(info.id))
+  }
   readMeta.set(String(info.id), meta)
   pruneReadMeta()
 
@@ -637,6 +647,17 @@ async function ensurePageImage(cid, p, meta, gate = pageGate) {
   const pending = pageInflight.get(key)
   if (pending) return pending
 
+  // 磁盘命中：重启服务、或内存过两小时被回收后重看同一章，直接读盘，不再向图源要
+  const onDisk = await pageStore.get(cid, p)
+  if (onDisk) {
+    rememberPage(key, onDisk)
+    if (meta) {
+      meta.dims = meta.dims || {}
+      if (onDisk.w && onDisk.h) meta.dims[p] = [onDisk.w, onDisk.h]
+    }
+    return onDisk
+  }
+
   const page = meta?.info?.pages?.[p - 1]
   if (!page) return null
 
@@ -673,6 +694,8 @@ async function ensurePageImage(cid, p, meta, gate = pageGate) {
         h,
       }
       rememberPage(key, item)
+      // 写盘是「下次阅读」的本钱；失败（磁盘满、只读）就当没缓存，不影响这次浏览
+      void pageStore.put(cid, p, item)
       if (meta && w && h) {
         meta.dims = meta.dims || {}
         meta.dims[p] = [w, h]
@@ -691,6 +714,25 @@ async function ensurePageImage(cid, p, meta, gate = pageGate) {
   }
 }
 
+// 读到第 p 页时，顺手把后 3 页排进后台队列。用户多半会往下滑，
+// 滑到的时候图片大概率已经落盘，滚动不再一格一格等。
+const prefetchAheadQueue = new Set()
+
+function prefetchAhead(cid, p, meta) {
+  const total = meta?.info?.pages?.length || 0
+  if (!total) return
+  for (let i = 1; i <= 3; i++) {
+    const next = p + i
+    if (next > total) break
+    const key = `${cid}:${next}`
+    if (pageCache.has(key) || pageInflight.has(key) || prefetchAheadQueue.has(key)) continue
+    prefetchAheadQueue.add(key)
+    ensurePageImage(cid, next, meta, prefetchGate)
+      .catch(() => {})
+      .finally(() => prefetchAheadQueue.delete(key))
+  }
+}
+
 async function handlePage(url, req, res) {
   const cid = String(url.searchParams.get('c') || '').replace(/\D/g, '')
   const p = parseInt(url.searchParams.get('p'), 10) || 0
@@ -698,8 +740,14 @@ async function handlePage(url, req, res) {
 
   const key = `${cid}:${p}`
   let meta = readMeta.get(cid)
-  if ((!meta || Date.now() - meta.time > READ_META_TTL) && !pageCache.has(key)) {
-    // 服务重启 / 元信息被回收：重拉一次页表。仍然只信任 API 返回的图片地址。
+  if (!meta || Date.now() - meta.time > READ_META_TTL) {
+    // 服务重启 / 元信息被回收。先看磁盘：这一页在本地就不必为了「拿到图片地址」再拉一次章节页表。
+    const disk = pageCache.has(key) ? null : await pageStore.get(cid, p)
+    if (disk) {
+      rememberPage(key, disk)
+      return sendPageImage(req, res, disk)
+    }
+    // 仍然只信任 API 返回的图片地址
     const albumId = meta?.albumId || ''
     const info = await chapterPages(client, repo, { id: cid, name: '', sort: 0 }, albumId)
     meta = { albumId, chapter: null, info, dims: {}, time: Date.now() }
@@ -711,6 +759,7 @@ async function handlePage(url, req, res) {
     const item = await ensurePageImage(cid, p, meta)
     if (!item) return sendError(res, 404, '页码超出范围')
     sendPageImage(req, res, item)
+    prefetchAhead(cid, p, meta)
   } catch (err) {
     sendError(res, 502, err?.serverMessage || err?.message || '图片获取失败')
   }
@@ -926,6 +975,7 @@ async function handleConfigSave(req, res) {
   await saveConfig(patch)
 
   client.applyProxy({ proxy: config.proxy, proxyMode: config.proxyMode })
+  pageStore.setLimitMB(config.pageCacheMB)
   // 代理变了就重新探测 API 主机
   if (before !== config.proxy) client.apiUrl = null
 
@@ -1010,6 +1060,7 @@ async function handleApi(req, res, url) {
         ok: true,
         total: list.length,
         size: list.reduce((s, it) => s + (it.size || 0), 0),
+        pages: pageStore.stats(),
         items: list.map((it) => ({
           key: String(it.file || '').replace(/\.pdf$/, ''),
           id: it.id,
@@ -1029,6 +1080,11 @@ async function handleApi(req, res, url) {
     if (method === 'DELETE' && p.startsWith('/cache/')) {
       const seg = p.split('/').filter(Boolean) // ['cache', id]
       const id = seg[1]
+      if (id === 'pages') {
+        const before = pageStore.stats()
+        await pageStore.clear()
+        return sendJson(res, 200, { ok: true, removed: before.files, size: before.size })
+      }
       if (id === 'all') {
         const n = await removeCachedPdf('all')
         return sendJson(res, 200, { ok: true, removed: n })
@@ -1120,6 +1176,7 @@ async function serveStatic(req, res, url) {
 async function main() {
   await loadConfig()
   client.applyProxy({ proxy: config.proxy, proxyMode: config.proxyMode })
+  pageStore.setLimitMB(config.pageCacheMB) // 磁盘上限以配置文件为准，模块创建时还是默认值
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)

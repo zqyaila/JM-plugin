@@ -22,6 +22,7 @@ export const DEFAULTS = {
   quality: 82,
   maxPages: 0,           // 0 = 不限制
   pageSize: 24,          // 搜索每页条数
+  pageCacheMB: 512,      // 阅读页磁盘缓存上限（MB），0 = 不限
   encrypt: 'none',       // none | id | custom（前端默认选中项）
   password: '',          // encrypt=custom 时的默认密码
 }
@@ -33,6 +34,7 @@ const NUM_RANGES = {
   quality: [1, 100],
   maxPages: [0, 100000],
   pageSize: [6, 60],
+  pageCacheMB: [0, 102400],
 }
 
 /** 读取配置（不存在则用默认值）。 */
