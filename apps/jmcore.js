@@ -35,6 +35,14 @@ export const HOST_SECRET = 'diosfjckwpqpdfjkvnqQjsik'   // 主机引导文件解
 // 使用第二个 secret + 明文 md5(secret) 作响应 key 的路径
 const CONTENT_PATHS = ['chapter_view_template']
 
+// 交互式接口（搜索 / 详情 / 章节表）的超时与重试策略。
+// 原先是「单次 20 秒 × 串行 3 次」，代理链路或某个 CDN 节点一卡就是 16~60 秒白屏；
+// 现在单次 10 秒封顶，GET 再叠加对冲：第一次 2.5 秒不回就并行补发（换下一个代理），谁先成功用谁。
+// 抓图/下载仍走 httpRequest 自己的长超时，不受这里影响。
+const API_TIMEOUT = 10000
+const API_HEDGE_DELAYS = [0, 2500, 5000]
+const API_POST_BACKOFF = 700
+
 // 主机引导 CDN
 const HOST_URLS = [
   'https://rup4a04-c02.tos-cn-hongkong.bytepluses.com/newsvr-2025.txt',
@@ -425,7 +433,6 @@ export class JmClient {
    */
   async request(method, path, params = {}) {
     if (!this.apiUrl) await this.bootstrap()
-    const time = Math.floor(Date.now() / 1000)
     const base = this.apiUrl.replace(/\/+$/, '')
     const cleanPath = path.replace(/^\/+/, '')
 
@@ -443,18 +450,6 @@ export class JmClient {
 
     const isContent = CONTENT_PATHS.some((p) => url.includes(p))
     const secret = isContent ? CONTENT_TOKEN_SECRET : TOKEN_SECRET
-    const tokenParam = `${time},${this.appVersion}`
-    const token = md5Hex(`${time}${secret}`)
-
-    const headers = {
-      Tokenparam: tokenParam,
-      Token: token,
-      version: CLIENT_VERSION,
-      'User-Agent': 'Mozilla/5.0',
-      Accept: '*/*',
-    }
-    if (this.jwtToken) headers.Authorization = `Bearer ${this.jwtToken}`
-    if (this.avsSession) headers.Cookie = `AVS=${this.avsSession}`
 
     let body = null
     if (!isGet) {
@@ -465,28 +460,110 @@ export class JmClient {
         pairs.push(`lang=${this.enc(this.lang)}`)
       }
       body = pairs.join('&')
-      headers['Content-Type'] = 'application/x-www-form-urlencoded'
     }
 
-    // 重试 3 次（对应 Kotlin 端重试逻辑）；每次重试轮换到下一个代理
-    let lastErr = null
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    // 每次尝试单独取时间戳：对冲的第二、三次比第一次晚几秒，复用旧签名可能被判过期。
+    const buildHeaders = (time) => {
+      const headers = {
+        Tokenparam: `${time},${this.appVersion}`,
+        Token: md5Hex(`${time}${secret}`),
+        version: CLIENT_VERSION,
+        'User-Agent': 'Mozilla/5.0',
+        Accept: '*/*',
+      }
+      if (this.jwtToken) headers.Authorization = `Bearer ${this.jwtToken}`
+      if (this.avsSession) headers.Cookie = `AVS=${this.avsSession}`
+      if (body) headers['Content-Type'] = 'application/x-www-form-urlencoded'
+      return headers
+    }
+
+    // 单次尝试：网络层异常标记 transient（换代理重发有意义），
+    // 协议层异常（服务器已明确回 code≠200 / HTTP 4xx）不标记，直接失败。
+    const attemptOnce = async () => {
+      const time = Math.floor(Date.now() / 1000)
+      let res
       try {
-        const res = await httpRequest(url, {
+        res = await httpRequest(url, {
           method,
-          headers,
+          headers: buildHeaders(time),
           body,
-          timeout: 20000,
+          timeout: API_TIMEOUT,
           proxy: this.rotateProxy('api'),
         })
-        const text = res.body.toString('utf8')
-        return this.parseResponse(text, url, time, res.status)
       } catch (e) {
-        lastErr = e
-        if (attempt < 3) await new Promise((r) => setTimeout(r, 600 * attempt))
+        e.transient = true
+        throw e
+      }
+      try {
+        return this.parseResponse(res.body.toString('utf8'), url, time, res.status)
+      } catch (e) {
+        // 5xx 说明是上游临时故障，换代理重试有意义；4xx / code≠200 直接失败
+        if (e.httpStatus >= 500) e.transient = true
+        throw e
       }
     }
-    throw new Error(lastErr?.message || '请求失败')
+
+    // POST 有副作用（登录、收藏、解锁），不能并发，只能串行重试。
+    if (!isGet) {
+      let lastErr = null
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          return await attemptOnce()
+        } catch (e) {
+          lastErr = e
+          if (e.transient !== true) break
+          if (attempt < 2) await new Promise((r) => setTimeout(r, API_POST_BACKOFF))
+        }
+      }
+      throw new Error(lastErr?.message || '请求失败')
+    }
+
+    // GET 对冲：按 API_HEDGE_DELAYS 依次起跑，第一个成功的胜出。
+    // 任何一次都以「瞬时错误」失败且当前没有别的请求在飞时，立刻补发下一次，不必干等计时器。
+    return await new Promise((resolve, reject) => {
+      const timers = []
+      let launched = 0
+      let inflight = 0
+      let settled = false
+      let lastErr = null
+
+      const clearTimers = () => {
+        while (timers.length) clearTimeout(timers.pop())
+      }
+      const settle = (fn, value) => {
+        if (settled) return
+        settled = true
+        clearTimers()
+        fn(value)
+      }
+      const launch = () => {
+        if (settled || launched >= API_HEDGE_DELAYS.length) return
+        launched++
+        inflight++
+        attemptOnce().then(
+          (value) => settle(resolve, value),
+          (e) => {
+            inflight--
+            lastErr = e
+            if (settled) return
+            // 服务器已经明确拒绝：重试只会再被拒一次，立即失败
+            if (e.transient !== true) return settle(reject, e)
+            if (inflight > 0) return // 还有并行的请求在飞，等它
+            if (launched < API_HEDGE_DELAYS.length) {
+              clearTimers()
+              launch()
+            } else {
+              settle(reject, lastErr)
+            }
+          },
+        )
+      }
+
+      API_HEDGE_DELAYS.forEach((delay, i) => {
+        if (i === 0) launch()
+        else timers.push(setTimeout(launch, delay))
+      })
+    })
   }
 
   parseResponse(bodyText, url, time, httpStatus) {
