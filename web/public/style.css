@@ -803,6 +803,8 @@ body[data-offline='1'] .stat {
   vertical-align: 1px;
 }
 
+.job-tag.local { color: var(--ok); background: rgba(55, 211, 153, 0.14); }
+
 .job {
   padding: 11px 12px;
   border-radius: 11px;
@@ -1425,3 +1427,127 @@ body.reading { overflow: hidden; }
 /* 详情页底部的「在线阅读」与主按钮并排 */
 .drawer-foot .btn.ghost { flex-shrink: 0; }
 
+
+/* ------------------------------------------------------------------
+   阅读缓存 → 直接导出（v1.6.2）
+   ------------------------------------------------------------------ */
+
+.reader-cache {
+  align-self: flex-start;
+  padding: 1px 7px;
+  margin-top: 1px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  white-space: nowrap;
+}
+.reader-cache.full { color: var(--ok); background: rgba(55, 211, 153, 0.12); border-color: rgba(55, 211, 153, 0.35); }
+
+#offline-section .section-title { display: flex; align-items: center; gap: 8px; }
+#offline-hint {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-mute);
+}
+#offline-hint::before { content: "·"; margin-right: 6px; opacity: 0.6; }
+
+.offline-loading { margin: 0; font-size: 12px; color: var(--text-mute); }
+
+.offline-meter {
+  height: 5px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.offline-meter i {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 0.5s var(--ease);
+}
+
+.offline-line {
+  margin: 9px 0 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.offline-line b { color: var(--text); font-weight: 650; }
+
+.offline-tag.ok {
+  color: var(--ok);
+  background: rgba(55, 211, 153, 0.12);
+  border-color: rgba(55, 211, 153, 0.35);
+}
+.offline-tag {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 7px;
+  font-size: 10.5px;
+  border-radius: 99px;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+}
+
+.offline-note {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-mute);
+}
+.offline-note b { color: var(--text-dim); font-weight: 600; }
+.offline-note.ok { color: rgba(55, 211, 153, 0.9); }
+.offline-note.warn { color: var(--warn); }
+
+.offline-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.offline-actions .btn { flex: 1 1 auto; }
+
+.reader-offline-note {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  color: var(--text-mute);
+}
+
+@media (max-width: 640px) {
+  /* 手机上副标题被隐藏，这个角标是「整本已缓存」唯一的提示，得留着 */
+  .reader-info .reader-cache { display: inline-flex; margin-top: 2px; font-size: 9.5px; padding: 0 6px; }
+}
+
+/* 任务面板顶部：整本已缓存，一点即出 PDF */
+.offline-ready {
+  margin: 10px 0 12px;
+  padding: 10px 12px 6px;
+  border: 1px solid rgba(55, 211, 153, 0.22);
+  background: rgba(55, 211, 153, 0.055);
+  border-radius: 12px;
+}
+.offline-ready-head {
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(55, 211, 153, 0.92);
+  margin-bottom: 4px;
+}
+.offline-ready-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+.offline-ready-row:first-of-type { border-top: 0; }
+.offline-ready-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.offline-ready-main b {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.offline-ready-main span { font-size: 11px; color: var(--text-mute); }
+.offline-ready-row .btn { flex-shrink: 0; height: 30px; padding: 0 11px; font-size: 12px; }

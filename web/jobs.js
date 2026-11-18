@@ -16,11 +16,12 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 
 import { getCachedPdf, putCachedPdf, cacheKey, DATA_DIR, PDF_DIR } from '../apps/store.js'
-import { buildChapterPdf, buildComicPdf, resolveChapters } from '../apps/jm.js'
+import { buildChapterPdf, buildComicPdf, buildCachedPdf, buildCachedComicPdf, resolveChapters } from '../apps/jm.js'
 import { createZipWriter } from '../apps/zip.js'
 
 const MAX_CONCURRENT = 2
 const MAX_JOBS_KEPT = 80
+const MERGE_PAGE_LIMIT = 350 // 单个文档的页数上限，和 server.js 的保持一致
 const PROGRESS_THROTTLE = 200 // ms
 const EXPORT_DIR = path.join(DATA_DIR, 'exports')
 const EXPORT_KEEP = 20
@@ -79,13 +80,27 @@ async function pruneExports() {
 }
 
 /**
- * @param {{client: import('../apps/jmcore.js').default, repo: any, getConfig: () => object}} deps
+ * @param {{client: import('../apps/jmcore.js').default, repo: any, getConfig: () => object,
+ *          getPage?: (cid: string, p: number) => Promise<{buf: Buffer} | null>}} deps
  */
-export function createJobManager({ client, repo, getConfig }) {
+export function createJobManager({ client, repo, getConfig, getPage }) {
   /** @type {Map<string, any>} */
   const jobs = new Map()
   const queue = []
   let running = 0
+
+  /** 阅读缓存读取器：导出时优先用「看过的页」，没看过的才联网下。 */
+  const loadCached =
+    typeof getPage === 'function'
+      ? async (cid, p) => {
+          try {
+            const hit = await getPage(cid, p)
+            return hit?.buf || null
+          } catch {
+            return null
+          }
+        }
+      : null
 
   function trim() {
     if (jobs.size <= MAX_JOBS_KEPT) return
@@ -109,6 +124,8 @@ export function createJobManager({ client, repo, getConfig }) {
       chapterCount: job.chapterCount || 0,
       files: job.files || 0,
       kind: job.kind || 'pdf',
+      source: job.source || 'net',
+      cacheHits: job.cacheHits || 0,
       failedChapters: job.failedChapters || [],
       title: job.title,
       status: job.status,
@@ -164,48 +181,80 @@ export function createJobManager({ client, repo, getConfig }) {
     }
 
     const range = job.whole ? null : { from: job.from, to: job.to }
-    const result = await buildComicPdf(
-      client,
-      repo,
-      job.albumId,
-      range,
-      userPassword,
-      job.ownerPassword || '',
-      (done, total) => {
-        update(job, { done, total, message: `正在下载第 ${done}/${total} 页` })
-      },
-      {
-        concurrency: Number(cfg.concurrency) || 4,
-        retries: 3,
-        retryDelay: 2000,
-        quality: Number(cfg.quality) || 82,
-      },
-    )
+    const offline = job.source === 'cache'
+    const result = offline
+      ? // 整本已缓存：完全走本地磁盘，连章节页表都不请求
+        await buildCachedComicPdf(job.chapters || [], {
+          getPage: loadCached,
+          userPassword,
+          ownerPassword: job.ownerPassword || '',
+          quality: Number(cfg.quality) || 82,
+          maxPagesPerFile: MERGE_PAGE_LIMIT,
+        }, {
+          onProgress: (done, total) => update(job, { done, total, message: `正在从本地缓存排版 ${done}/${total} 页` }),
+        })
+      : await buildComicPdf(
+          client,
+          repo,
+          job.albumId,
+          range,
+          userPassword,
+          job.ownerPassword || '',
+          (done, total) => {
+            update(job, { done, total, message: `正在下载第 ${done}/${total} 页` })
+          },
+          {
+            concurrency: Number(cfg.concurrency) || 4,
+            retries: 3,
+            retryDelay: 2000,
+            quality: Number(cfg.quality) || 82,
+            loadCached,
+          },
+        )
 
     await putCachedPdf(job.albumId, tag, result.buf, {
-      name: result.name,
+      name: result.name || job.title,
       pageCount: result.pageCount,
       userPassword: result.userPassword,
       ownerPassword: result.ownerPassword,
       from: job.from,
       to: job.to,
+      source: offline ? 'cache' : 'net',
     })
 
-    job.title = result.name
+    job.title = result.name || job.title
     job.size = result.buf.length
     job.done = result.pageCount
     job.total = result.pageCount
     job.kind = 'pdf'
+    job.cacheHits = result.cacheHits || 0
     job.file = path.join(PDF_DIR, `${cacheKey(job.albumId, tag)}.pdf`)
-    update(job, { status: 'done', message: `已生成 ${result.pageCount} 页 PDF`, finishedAt: Date.now() }, { force: true })
+    const fromCacheText = job.cacheHits
+      ? `（${job.cacheHits} 页来自阅读缓存${job.cacheHits === result.pageCount ? '，未重新下载' : ''}）`
+      : ''
+    update(
+      job,
+      { status: 'done', message: `已生成 ${result.pageCount} 页 PDF${fromCacheText}`, finishedAt: Date.now() },
+      { force: true },
+    )
     push(job, 'done')
   }
 
   // ---------------------------------------------------------------- 分章打包
 
   async function runZip(job, cfg, userPassword) {
+    const offline = job.source === 'cache'
     const range = job.whole ? null : { from: job.from, to: job.to }
-    const { detail, chapters } = await resolveChapters(repo, job.albumId, range)
+    let detail
+    let chapters
+    if (offline) {
+      // 章节、页数都来自本地登记簿，不请求详情 / 页表
+      chapters = (job.chapters || []).map((c) => ({ ...c, id: c.cid, totalPage: c.pages }))
+      detail = { id: job.albumId, name: job.title || `JM${job.albumId}` }
+      if (!chapters.length) throw new Error('没有可用的本地缓存章节')
+    } else {
+      ;({ detail, chapters } = await resolveChapters(repo, job.albumId, range))
+    }
 
     job.title = job.title || detail.name
     job.chapterCount = chapters.length
@@ -213,7 +262,11 @@ export function createJobManager({ client, repo, getConfig }) {
     job.total = chapters.reduce((sum, c) => sum + (Number(c.totalPage) || 0), 0) || chapters.length
     job.byPages = chapters.some((c) => Number(c.totalPage) > 0)
     job.done = 0
-    update(job, { message: `共 ${chapters.length} 章，约 ${job.total} 页，开始下载…` }, { force: true })
+    update(
+      job,
+      { message: `共 ${chapters.length} 章，约 ${job.total} 页，${offline ? '开始从本地缓存排版…' : '开始下载…'}` },
+      { force: true },
+    )
 
     await fsp.mkdir(EXPORT_DIR, { recursive: true })
     await pruneExports()
@@ -240,33 +293,17 @@ export function createJobManager({ client, repo, getConfig }) {
 
         try {
 
-          // 命中缓存（同一密码策略）就直接拿去打包，不重复下载
-          const cached = await getCachedPdf(job.albumId, ch.sort)
           let parts
-          if (cached && (cached.meta?.userPassword ?? '') === userPassword) {
-            parts = [
+          if (offline) {
+            // 整本已缓存：每章都从磁盘读图，不联网
+            parts = await buildCachedPdf(
+              [{ sort: ch.sort, name: ch.name, cid: ch.cid, pages: ch.pages }],
               {
-                sort: ch.sort,
-                part: 1,
-                parts: 1,
-                name: ch.name,
-                path: cached.file,
-                pageCount: cached.meta.pageCount || 0,
-              },
-            ]
-            job.cachedChapters = (job.cachedChapters || 0) + 1
-          } else {
-            parts = await buildChapterPdf(
-              client,
-              repo,
-              job.albumId,
-              ch,
-              {
+                getPage: loadCached,
                 userPassword,
                 ownerPassword: job.ownerPassword || '',
-                concurrency: Number(cfg.concurrency) || 4,
                 quality: Number(cfg.quality) || 82,
-                maxPagesPerFile: 350,
+                maxPagesPerFile: MERGE_PAGE_LIMIT,
               },
               {
                 onProgress: (n, t) => {
@@ -276,24 +313,71 @@ export function createJobManager({ client, repo, getConfig }) {
                       ? {
                           done: donePages + n,
                           total: Math.max(job.total, donePages + t),
-                          message: `第 ${chapterNo} 章 · ${n}/${t} 页`,
+                          message: `第 ${chapterNo} 章 · 本地缓存 ${n}/${t} 页`,
                         }
-                      : { message: `第 ${chapterNo} 章 · ${n}/${t} 页` },
+                      : { message: `第 ${chapterNo} 章 · 本地缓存 ${n}/${t} 页` },
                   )
                 },
               },
             )
+            job.cacheHits = (job.cacheHits || 0) + parts.reduce((n, p) => n + (p.cacheHits || 0), 0)
+          } else {
+            // 命中缓存（同一密码策略）就直接拿去打包，不重复下载
+            const cached = await getCachedPdf(job.albumId, ch.sort)
+            if (cached && (cached.meta?.userPassword ?? '') === userPassword) {
+              parts = [
+                {
+                  sort: ch.sort,
+                  part: 1,
+                  parts: 1,
+                  name: ch.name,
+                  path: cached.file,
+                  pageCount: cached.meta.pageCount || 0,
+                },
+              ]
+              job.cachedChapters = (job.cachedChapters || 0) + 1
+            } else {
+              parts = await buildChapterPdf(
+                client,
+                repo,
+                job.albumId,
+                ch,
+                {
+                  userPassword,
+                  ownerPassword: job.ownerPassword || '',
+                  concurrency: Number(cfg.concurrency) || 4,
+                  quality: Number(cfg.quality) || 82,
+                  maxPagesPerFile: 350,
+                  loadCached,
+                },
+                {
+                  onProgress: (n, t) => {
+                    update(
+                      job,
+                      job.byPages
+                        ? {
+                            done: donePages + n,
+                            total: Math.max(job.total, donePages + t),
+                            message: `第 ${chapterNo} 章 · ${n}/${t} 页`,
+                          }
+                        : { message: `第 ${chapterNo} 章 · ${n}/${t} 页` },
+                    )
+                  },
+                },
+              )
+              job.cacheHits = (job.cacheHits || 0) + parts.reduce((n, p) => n + (p.cacheHits || 0), 0)
 
-            // 单章只有一个分卷时才缓存（多分卷的缓存键会撞车，意义也不大）
-            for (const p of parts) {
-              if (p.parts === 1) {
-                await putCachedPdf(job.albumId, ch.sort, p.buf, {
-                  name: p.name,
-                  pageCount: p.pageCount,
-                  userPassword: p.userPassword,
-                  ownerPassword: p.ownerPassword,
-                })
-                p.path = path.join(PDF_DIR, `${cacheKey(job.albumId, ch.sort)}.pdf`)
+              // 单章只有一个分卷时才缓存（多分卷的缓存键会撞车，意义也不大）
+              for (const p of parts) {
+                if (p.parts === 1) {
+                  await putCachedPdf(job.albumId, ch.sort, p.buf, {
+                    name: p.name,
+                    pageCount: p.pageCount,
+                    userPassword: p.userPassword,
+                    ownerPassword: p.ownerPassword,
+                  })
+                  p.path = path.join(PDF_DIR, `${cacheKey(job.albumId, ch.sort)}.pdf`)
+                }
               }
             }
           }
@@ -340,12 +424,15 @@ export function createJobManager({ client, repo, getConfig }) {
       job.size = meta.size
       job.total = job.byPages ? Math.max(job.total, donePages) : chapters.length
       job.done = job.total
+      const cacheText = job.cacheHits
+        ? `（${job.cacheHits} 页来自阅读缓存${offline && job.cacheHits >= job.total ? '，未重新下载' : ''}）`
+        : ''
       update(
         job,
         {
           status: 'done',
           message:
-            `${chapters.length} 章 · ${files} 个 PDF · 已打包` +
+            `${chapters.length} 章 · ${files} 个 PDF · 已打包${cacheText}` +
             (failed.length ? `（${failed.length} 章失败：第 ${failed.map((f) => f.sort).join('、')} 章）` : ''),
           finishedAt: Date.now(),
         },
@@ -370,7 +457,8 @@ export function createJobManager({ client, repo, getConfig }) {
     client.applyProxy({ proxy: cfg.proxy, proxyMode: cfg.proxyMode })
 
     try {
-      if (!client.apiUrl) {
+      // 离线导出完全走磁盘，不需要 API 主机；网络挂了也能出 PDF
+      if (job.source !== 'cache' && !client.apiUrl) {
         await Promise.race([
           client.bootstrap(),
           new Promise((_, reject) =>
@@ -380,6 +468,9 @@ export function createJobManager({ client, repo, getConfig }) {
       }
 
       const userPassword = job.password || ''
+      if (job.source === 'cache') {
+        update(job, { message: '正在读取本地缓存…' }, { force: true })
+      }
       if (job.mode === 'zip') await runZip(job, cfg, userPassword)
       else await runSingle(job, cfg, userPassword)
     } catch (err) {
@@ -404,7 +495,8 @@ export function createJobManager({ client, repo, getConfig }) {
     /**
      * 创建任务。
      * @param {{albumId:string, from?:number|null, to?:number|null, mode?:'single'|'zip',
-     *          title?:string, pages?:number, encrypt?:string, password?:string}} input
+     *          whole?:boolean, title?:string, pages?:number, encrypt?:string, password?:string,
+     *          source?:'net'|'cache', chapters?:Array<{sort:number,name:string,cid:string,pages:number}>}} input
      */
     create({
       albumId,
@@ -416,6 +508,8 @@ export function createJobManager({ client, repo, getConfig }) {
       pages = 0,
       encrypt = 'none',
       password = '',
+      source = 'net',
+      chapters = null,
     }) {
       const job = {
         id: newId(),
@@ -424,6 +518,8 @@ export function createJobManager({ client, repo, getConfig }) {
         to: to == null ? null : Number(to),
         whole: !!whole,
         mode: mode === 'zip' ? 'zip' : 'single',
+        source: source === 'cache' ? 'cache' : 'net',
+        chapters: source === 'cache' ? chapters || [] : null,
         title: title || `JM${albumId}`,
         pages,
         encrypt,
@@ -437,6 +533,7 @@ export function createJobManager({ client, repo, getConfig }) {
         files: 0,
         kind: mode === 'zip' ? 'zip' : 'pdf',
         cached: false,
+        cacheHits: 0,
         createdAt: Date.now(),
         finishedAt: null,
         subscribers: new Set(),

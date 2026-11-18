@@ -485,11 +485,14 @@ export async function chapterPages(client, repo, chapter, albumId) {
     name: rd.name || chapter.name || '',
     scrambleId: Number(rd.scrambleId) || 0,
     totalPage: Number(rd.totalPage) || 0,
-    pages: (rd.images || []).map((p) => ({
+    // cid / idx 是给「阅读缓存复用」用的：导出 PDF 时按这两项去磁盘上找已经看过的页
+    pages: (rd.images || []).map((p, i) => ({
       url: client.imgUrl(p.image),
       aid,
       scrambleId: rd.scrambleId,
       page: p.page,
+      cid: String(rd.id || chapter.id),
+      idx: i + 1,
     })),
   }
 }
@@ -507,7 +510,17 @@ async function pagesOfChapter(client, repo, chapter, albumId) {
  * 现在每章（或每 350 页）单独建文档、单独落盘，内存只与这一批的页数有关。
  */
 async function writePdf(client, m, sharp, pages, opts) {
-  const { concurrency = 4, retries = 3, retryDelay = 2000, quality = 82, userPassword = '', ownerPassword = '', onPage } = opts
+  const {
+    concurrency = 4,
+    retries = 3,
+    retryDelay = 2000,
+    quality = 82,
+    userPassword = '',
+    ownerPassword = '',
+    onPage,
+    loadCached,
+    strictCache = false,
+  } = opts
 
   const up = userPassword || ''
   const op = ownerPassword || ''
@@ -522,12 +535,37 @@ async function writePdf(client, m, sharp, pages, opts) {
   const total = pages.length
   const windowSize = Math.max(1, Math.min(concurrency, total))
   const inflight = new Map()
+  let cacheHits = 0
 
-  const openPage = (i) => {
+  const openPage = async (i) => {
     const pg = pages[i]
-    return fetchPageImageRetry(client, pg.url, pg.aid, pg.scrambleId, { retries, retryDelay })
-      .then((r) => ({ ok: true, r }))
-      .catch((error) => ({ ok: false, error }))
+    // 阅读时已经落盘的页直接读磁盘：导出整本时通常一页都不用重新下载
+    if (loadCached && pg.cid && pg.idx) {
+      try {
+        const buf = await loadCached(pg.cid, pg.idx)
+        if (buf) {
+          cacheHits += 1
+          return { ok: true, r: { buf }, fromCache: true }
+        }
+      } catch {
+        /* 磁盘读失败就当没缓存，走网络 */
+      }
+      if (strictCache) {
+        const where = pg.cht ? `第 ${pg.cht} 章第 ${pg.idx} 页` : `第 ${pg.idx} 页`
+        return {
+          ok: false,
+          error: new Error(
+            `${where}不在本地缓存里（可能被容量上限淘汰了）。请先在阅读器里翻到这一页，或改用联网导出。`,
+          ),
+        }
+      }
+    }
+    try {
+      const r = await fetchPageImageRetry(client, pg.url, pg.aid, pg.scrambleId, { retries, retryDelay })
+      return { ok: true, r }
+    } catch (error) {
+      return { ok: false, error }
+    }
   }
 
   for (let i = 0; i < windowSize; i++) inflight.set(i, openPage(i))
@@ -566,7 +604,7 @@ async function writePdf(client, m, sharp, pages, opts) {
   }
 
   const bytes = writer.end()
-  return { buf: Buffer.from(bytes), pageCount: total, userPassword: up, ownerPassword: op }
+  return { buf: Buffer.from(bytes), pageCount: total, userPassword: up, ownerPassword: op, cacheHits }
 }
 
 /** 加载 WASM 与 sharp（模块级缓存，多次调用只有第一次真的初始化）。 */
@@ -611,6 +649,7 @@ export async function buildChapterPdf(client, repo, albumId, chapter, opts = {},
       quality,
       userPassword: opts.userPassword || '',
       ownerPassword: opts.ownerPassword || '',
+      loadCached: opts.loadCached,
       onPage: (n, t) => hooks.onProgress?.(n, t, i + 1, chunkCount),
     })
     parts.push({
@@ -622,9 +661,49 @@ export async function buildChapterPdf(client, repo, albumId, chapter, opts = {},
       pageCount: res.pageCount,
       userPassword: res.userPassword,
       ownerPassword: res.ownerPassword,
+      cacheHits: res.cacheHits || 0,
     })
   }
   return parts
+}
+
+/**
+ * 把整本已缓存的章节合成**一个** PDF（离线导出用，不联网）。
+ * 页数超过 maxPagesPerFile 时直接报错，让用户改选「每章一个 PDF 打包」。
+ */
+export async function buildCachedComicPdf(chapters, opts = {}, hooks = {}) {
+  const { getPage, userPassword = '', ownerPassword = '', quality = 82, maxPagesPerFile = 350 } = opts
+  if (typeof getPage !== 'function') throw new Error('缺少缓存读取函数')
+
+  const pages = []
+  for (const ch of chapters) {
+    const n = Number(ch.pages) || 0
+    for (let p = 1; p <= n; p++) pages.push({ cid: ch.cid, idx: p, cht: ch.sort })
+  }
+  if (!pages.length) throw new Error('本地缓存里没有可导出的页面')
+  if (pages.length > maxPagesPerFile) {
+    throw new Error(
+      `整本 ${pages.length} 页，超过单个 PDF 上限 ${maxPagesPerFile} 页。请改用「每章一个 PDF 打包」，这两条路都只读本地缓存。`,
+    )
+  }
+
+  const { m, sharp } = await prepare()
+  const res = await writePdf(null, m, sharp, pages, {
+    concurrency: 4,
+    quality,
+    userPassword,
+    ownerPassword,
+    loadCached: getPage,
+    strictCache: true,
+    onPage: (n, t) => hooks.onProgress?.(n, t),
+  })
+  return {
+    buf: res.buf,
+    pageCount: res.pageCount,
+    userPassword: res.userPassword,
+    ownerPassword: res.ownerPassword,
+    cacheHits: res.cacheHits || 0,
+  }
 }
 
 /**
@@ -633,7 +712,14 @@ export async function buildChapterPdf(client, repo, albumId, chapter, opts = {},
  * @param {number|null|{from:number,to:number}} chapterIdx 章节范围
  */
 export async function buildComicPdf(client, repo, albumId, chapterIdx = null, userPassword = '', ownerPassword = '', onProgress, opts = {}) {
-  const { concurrency = 4, retries = 3, retryDelay = 2000, quality = 82, maxPagesPerFile = 350 } = opts
+  const {
+    concurrency = 4,
+    retries = 3,
+    retryDelay = 2000,
+    quality = 82,
+    maxPagesPerFile = 350,
+    loadCached,
+  } = opts
   const { m, sharp } = await prepare()
 
   const { detail, chapters } = await resolveChapters(repo, albumId, chapterIdx)
@@ -660,6 +746,7 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
     quality,
     userPassword,
     ownerPassword,
+    loadCached,
     onPage: (n, t) => onProgress?.(n, t),
   })
 
@@ -668,8 +755,68 @@ export async function buildComicPdf(client, repo, albumId, chapterIdx = null, us
     pageCount: res.pageCount,
     userPassword: res.userPassword,
     ownerPassword: res.ownerPassword,
+    cacheHits: res.cacheHits || 0,
     name: detail.name || `JM${albumId}`,
   }
+}
+
+/**
+ * 只用本地阅读缓存出 PDF —— 「整本看完了，直接变成下载」的那条路。
+ *
+ * 不去请求章节页表、也不去图源要图：章节 id 和页数都由 offline 登记簿给出，
+ * 每一页从 `opts.getPage(cid, 页码)` 取。任何一页缺失就报错（strictCache），
+ * 由调用方决定是提示用户补看，还是退回联网导出。
+ *
+ * @param {Array<{sort:number,name:string,cid:string,pages:number}>} chapters
+ * @param {{getPage:(cid:string,p:number)=>Promise<Buffer|null>, userPassword?:string,
+ *          ownerPassword?:string, quality?:number, maxPagesPerFile?:number}} opts
+ * @returns {Promise<Array<{sort:number,part:number,parts:number,name:string,buf:Buffer,
+ *          pageCount:number,userPassword:string,ownerPassword:string,cacheHits:number}>>}
+ */
+export async function buildCachedPdf(chapters, opts = {}, hooks = {}) {
+  const {
+    getPage,
+    userPassword = '',
+    ownerPassword = '',
+    quality = 82,
+    maxPagesPerFile = 350,
+  } = opts
+  if (typeof getPage !== 'function') throw new Error('缺少缓存读取函数')
+  const { m, sharp } = await prepare()
+
+  const parts = []
+  for (const ch of chapters) {
+    const total = Number(ch.pages) || 0
+    if (!total) continue
+    const chunkCount = Math.max(1, Math.ceil(total / maxPagesPerFile))
+    for (let i = 0; i < chunkCount; i++) {
+      const start = i * maxPagesPerFile
+      const end = Math.min(total, start + maxPagesPerFile)
+      const list = []
+      for (let p = start + 1; p <= end; p++) list.push({ cid: ch.cid, idx: p, cht: ch.sort })
+      const res = await writePdf(null, m, sharp, list, {
+        concurrency: Math.min(4, list.length),
+        quality,
+        userPassword,
+        ownerPassword,
+        loadCached: getPage,
+        strictCache: true,
+        onPage: (n, t) => hooks.onProgress?.(n, t, ch.sort, i + 1, chunkCount),
+      })
+      parts.push({
+        sort: ch.sort,
+        part: i + 1,
+        parts: chunkCount,
+        name: ch.name || `第${ch.sort}章`,
+        buf: res.buf,
+        pageCount: res.pageCount,
+        userPassword: res.userPassword,
+        ownerPassword: res.ownerPassword,
+        cacheHits: res.cacheHits || 0,
+      })
+    }
+  }
+  return parts
 }
 
 /**

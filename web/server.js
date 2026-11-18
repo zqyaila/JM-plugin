@@ -25,6 +25,7 @@ import { proxyRequest, testProxy, parseProxyList, maskProxy } from '../apps/prox
 import { config, loadConfig, saveConfig, publicConfig, resolveServerOptions, DATA_DIR } from './config.js'
 import { createJobManager } from './jobs.js'
 import { createPageStore } from './pagecache.js'
+import { createOfflineIndex } from './offline.js'
 import { createFavorites } from './favorites.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -49,7 +50,21 @@ const MIME = {
 
 const client = new JmClient()
 const repo = new JmRepository(client)
-const jobs = createJobManager({ client, repo, getConfig: () => config })
+
+// 阅读页磁盘缓存 + 「整本读完了没有」的登记簿。都放在最前面创建：
+// 任务队列要用 pageStore 当导出时的本地图源，晚于 jobs 创建就赶不上了。
+const pageStore = createPageStore({
+  dir: path.join(DATA_DIR, 'pages'),
+  limitMB: config.pageCacheMB,
+})
+const offline = createOfflineIndex({ file: path.join(DATA_DIR, 'offline.json'), pages: pageStore })
+
+const jobs = createJobManager({
+  client,
+  repo,
+  getConfig: () => config,
+  getPage: (cid, p) => pageStore.get(cid, p),
+})
 const options = resolveServerOptions()
 
 /** 列出本机所有非回环 IPv4，启动时直接告诉用户「别的设备该访问哪个地址」。 */
@@ -493,10 +508,7 @@ const seriesCache = new Map() // albumId -> { detail, time }
 const PAGE_TTL = 2 * 60 * 60 * 1000
 const PAGE_CACHE_MAX = 192 * 1024 * 1024
 // 内存只是一层热缓存；真正让「看过的页不用再下」的是磁盘这份，见 web/pagecache.js
-const pageStore = createPageStore({
-  dir: path.join(DATA_DIR, 'pages'),
-  limitMB: config.pageCacheMB,
-})
+// （pageStore 在文件顶部创建，任务队列导出 PDF 时也复用它）
 // 本地收藏夹：不依赖 JM 账号，存 data/favorites.json
 const favorites = createFavorites({ file: path.join(DATA_DIR, 'favorites.json') })
 const pageCache = new Map() // `${chapterId}:${p}` -> { buf, type, etag, time }
@@ -546,6 +558,19 @@ function pruneReadMeta() {
   }
   while (readMeta.size > READ_META_MAX) {
     readMeta.delete(readMeta.keys().next().value)
+  }
+}
+
+/**
+ * 整本缓存齐了，就把这些章节「钉住」：否则读一本 300 页的漫画，
+ * 读到最后一章时第一章早被 LRU 淘汰，「整本缓存」永远凑不齐。
+ */
+async function syncPins(albumId) {
+  try {
+    const cov = await offline.coverage(albumId)
+    if (cov?.complete) pageStore.pin(cov.chapters.map((c) => c.cid))
+  } catch {
+    /* 钉不住最多是多下几张图，不值得打断阅读 */
   }
 }
 
@@ -648,6 +673,21 @@ async function handleRead(url, res) {
   }
   readMeta.set(String(info.id), meta)
   pruneReadMeta()
+
+  // 登记「这一章属于哪本、一共几页」：读完整本后就能直接从磁盘出 PDF，
+  // 不用为了导出去把几百页重新下一遍。写登记簿很便宜，失败也不影响阅读。
+  void offline
+    .recordChapter({
+      albumId: id,
+      albumName: detail.name,
+      totalChapters: series.length,
+      sort: chapter.sort,
+      cid: info.id,
+      name: chapter.name || info.name,
+      pages: info.pages.length,
+    })
+    .then(() => syncPins(id))
+    .catch(() => {})
 
   // 先量出第一屏这两页的真实尺寸：阅读器按真实比例占位，图片到位不再跳动。
   // 只等两页是为了别让「点开章节」等上五六秒；其余页放在后台预热，
@@ -832,6 +872,60 @@ async function handlePage(url, req, res) {
   }
 }
 
+/**
+ * 用阅读缓存直接出 PDF —— 「整本看完了，直接变成下载」。
+ *
+ * 不请求作品详情、不请求章节页表、不下载任何图片：章节 id 与页数都来自
+ * data/offline.json，图片从 data/pages 读。因此断网也能导出，速度只受磁盘限制。
+ */
+async function createOfflineJob({ res, id, mode, from, to, encrypt, password }) {
+  const cov = await offline.coverage(id)
+  if (!cov || !cov.chapters.length) {
+    return sendError(res, 409, '这部作品还没有阅读缓存，先在阅读器里看一遍再导出')
+  }
+
+  const inRange = (c) => (from == null && to == null) || (c.sort >= from && c.sort <= to)
+  const chapters = cov.chapters.filter(inRange)
+  if (!chapters.length) return sendError(res, 409, '所选章节还没有缓存')
+
+  const missing = chapters.filter((c) => !c.complete)
+  if (missing.length) {
+    const lack = missing.reduce((n, c) => n + (c.pages - c.cached), 0)
+    const list = missing.slice(0, 3).map((c) => `第${c.sort}章`).join('、')
+    return sendError(
+      res,
+      409,
+      `${list}${missing.length > 3 ? ' 等' : ''}还没缓存完（共缺 ${lack} 页）。` +
+        '先在阅读器里翻完这几章再导出；也可以直接联网导出——已经看过的页不会被重复下载。',
+    )
+  }
+
+  const pages = chapters.reduce((n, c) => n + c.pages, 0)
+  if (mode === 'single' && pages > MERGE_PAGE_LIMIT) {
+    return sendError(
+      res,
+      400,
+      `所选范围 ${pages} 页，单个 PDF 上限 ${MERGE_PAGE_LIMIT} 页。请改用「每章一个 PDF 打包」，同样只读本地缓存。`,
+    )
+  }
+
+  const job = jobs.create({
+    albumId: id,
+    from,
+    to,
+    whole: from == null && to == null,
+    mode,
+    title: cov.name || `JM${id}`,
+    pages,
+    encrypt,
+    password,
+    source: 'cache',
+    chapters: chapters.map((c) => ({ sort: c.sort, name: c.name, cid: c.cid, pages: c.pages })),
+  })
+
+  sendJson(res, 200, { ok: true, job })
+}
+
 async function handleCreateJob(req, res) {
   const body = await readJsonBody(req)
   const id = normalizeAlbumId(body.id)
@@ -851,6 +945,9 @@ async function handleCreateJob(req, res) {
   if (Number.isNaN(from) || Number.isNaN(to)) return sendError(res, 400, '章节序号不合法')
   if (from != null && to != null && from > to) [from, to] = [to, from]
 
+  // 整本：前端明确说了 whole 就把范围抹掉，别让 from/to 把缓存键写成区间
+  if (body.whole === true) from = to = null
+
   const encrypt = ['none', 'id', 'custom'].includes(body.encrypt) ? body.encrypt : 'none'
   let password = ''
   if (encrypt === 'custom') {
@@ -859,6 +956,11 @@ async function handleCreateJob(req, res) {
     if (password.length > 32) return sendError(res, 400, '密码最多 32 个字符')
   } else if (encrypt === 'id') {
     password = id
+  }
+
+  // 离线模式：只用阅读缓存出 PDF，一页都不联网
+  if (body.source === 'cache') {
+    return await createOfflineJob({ res, id, mode, from, to, encrypt, password })
   }
 
   await ensureClient()
@@ -1068,6 +1170,43 @@ async function handleProxyTest(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// 阅读缓存 / 离线导出
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/offline            已读过的作品列表（带覆盖率）
+ * GET /api/offline?id=123456  单本覆盖率，抽屉与阅读器都用它
+ */
+async function handleOffline(url, res) {
+  const raw = url.searchParams.get('id')
+  if (raw) {
+    const id = normalizeAlbumId(raw)
+    if (!id) return sendError(res, 400, 'JM 号不合法')
+    return sendJson(res, 200, { ok: true, coverage: await offline.coverage(id) })
+  }
+
+  const list = await offline.list()
+  const items = []
+  for (const alb of list.slice(0, 100)) {
+    const cov = await offline.coverage(alb.id)
+    if (!cov) continue
+    items.push({
+      id: cov.id,
+      name: cov.name || `JM${cov.id}`,
+      total: cov.total,
+      chapters: cov.chapters.length,
+      chaptersCached: cov.chaptersCached,
+      pages: cov.pages,
+      pagesCached: cov.pagesCached,
+      size: cov.size,
+      complete: cov.complete,
+      time: cov.time,
+    })
+  }
+  sendJson(res, 200, { ok: true, items, pages: pageStore.stats() })
+}
+
+// ---------------------------------------------------------------------------
 // 收藏
 // ---------------------------------------------------------------------------
 
@@ -1176,6 +1315,7 @@ async function handleApi(req, res, url) {
     if (method === 'DELETE' && p.startsWith('/favorites')) {
       return await handleFavoriteRemove(url, res, p.split('/')[2])
     }
+    if (method === 'GET' && p === '/offline') return await handleOffline(url, res)
 
     if (method === 'POST' && p === '/jobs') return await handleCreateJob(req, res)
     if (method === 'GET' && p === '/jobs') return sendJson(res, 200, { ok: true, jobs: jobs.list() })
@@ -1222,6 +1362,7 @@ async function handleApi(req, res, url) {
       if (id === 'pages') {
         const before = pageStore.stats()
         await pageStore.clear()
+        await offline.clear() // 图片都删了，登记簿再留着只会显示一堆 0/12 章
         return sendJson(res, 200, { ok: true, removed: before.files, size: before.size })
       }
       if (id === 'all') {
@@ -1317,6 +1458,12 @@ async function main() {
   client.applyProxy({ proxy: config.proxy, proxyMode: config.proxyMode })
   pageStore.setLimitMB(config.pageCacheMB) // 磁盘上限以配置文件为准，模块创建时还是默认值
 
+  // 重启后把「整本已读完」的章节重新钉住，否则下次一开新章节就可能把它们淘汰掉
+  void offline
+    .pinnedChapters()
+    .then((cids) => cids.length && pageStore.pin(cids))
+    .catch(() => {})
+
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
     const started = Date.now()
@@ -1405,6 +1552,8 @@ async function main() {
 
   const shutdown = () => {
     console.log('\n正在关闭…')
+    // 登记簿是「整本缓存完没有」的依据，退出前把排队中的那次写盘落下去
+    void offline.flush().catch(() => {})
     server.close(() => process.exit(0))
     setTimeout(() => process.exit(0), 3000).unref()
   }

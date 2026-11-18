@@ -122,6 +122,7 @@ const el = {
   readerBack: $('#reader-back'),
   readerTitle: $('#reader-title'),
   readerSub: $('#reader-sub'),
+  readerCache: $('#reader-cache'),
   readerChapter: $('#reader-chapter'),
   readerWidth: $('#reader-width'),
   readerFull: $('#reader-full'),
@@ -147,6 +148,7 @@ const state = {
   page: 1,
   totalPages: 1,
   album: null,
+  offline: null, // { album, cov }：当前抽屉对应作品的阅读缓存覆盖率
   from: 1,
   to: 1,
   split: 'single',
@@ -157,6 +159,7 @@ const state = {
   favorites: new Map(), // id -> { id, name, author, time }
   jobs: new Map(),
   cacheItems: [],
+  offlineItems: [], // 整本已缓存、可一键离线导出的作品
   cacheSig: '',
   openGroups: loadOpenGroups(),
   seq: 0,
@@ -173,6 +176,7 @@ const state = {
     posObserver: null,
     token: 0,
     saveTimer: null,
+    offline: null,
   },
 }
 
@@ -787,6 +791,7 @@ async function openDetail(id) {
   el.drawer.classList.add('open')
   el.drawer.setAttribute('aria-hidden', 'false')
   openScrim()
+  state.offline = null
   el.drawerBody.innerHTML = `<div style="padding:26px 22px;display:grid;gap:16px">
     <div class="skeleton" style="width:116px;aspect-ratio:3/4;height:auto"></div>
     <div class="skeleton" style="height:20px;width:70%;aspect-ratio:auto"></div>
@@ -898,6 +903,11 @@ function renderDetail(album) {
       </div>
     </div>
 
+    <div class="section" id="offline-section">
+      <h3 class="section-title">阅读缓存 <span id="offline-hint">检查中…</span></h3>
+      <div id="offline-body"><p class="offline-loading">正在检查本地缓存…</p></div>
+    </div>
+
     <div class="drawer-foot">
       <div class="summary" id="job-summary">整本</div>
       <button class="btn ghost" id="btn-read">在线阅读</button>
@@ -933,6 +943,8 @@ function renderDetail(album) {
     state.split = e.target.value
     $$('.radio', splitGroup).forEach((n) => n.classList.toggle('checked', $('input', n).checked))
     updateSummary()
+    // 「合并/分章」会影响离线按钮是否可用（整本超过 350 页只能分章）
+    if (state.offline?.cov) renderOfflineSection(state.offline.album, state.offline.cov)
   })
 
   // 加密方式
@@ -968,6 +980,9 @@ function renderDetail(album) {
   })
 
   $('#btn-build', el.drawerBody).addEventListener('click', startJob)
+
+  // 阅读缓存：看过的页都在本机，整本看完后可以直接出 PDF
+  void loadOfflineInto(album)
 
   // 在线阅读：有历史记录就从上次那一章接着看
   const readBtn = $('#btn-read', el.drawerBody)
@@ -1057,6 +1072,126 @@ function updateSummary() {
 
 el.drawerClose.addEventListener('click', closeDrawer)
 el.scrim.addEventListener('click', closeDrawer)
+
+// ---------------------------------------------------------------------------
+// 阅读缓存 → 直接出 PDF
+//
+// 阅读器把看过的页存在服务端磁盘上，并把「哪章属于哪本、共几页」登记下来。
+// 整本都看过之后，导出就不必再下载任何图片：只做排版，几秒出结果。
+// ---------------------------------------------------------------------------
+
+async function loadOfflineInto(album) {
+  const slot = $('#offline-body', el.drawerBody)
+  if (!slot) return
+  try {
+    const { coverage } = await api(`/api/offline?id=${encodeURIComponent(album.id)}`, { timeout: 12000 })
+    if (!slot.isConnected) return
+    state.offline = { album, cov: coverage }
+    renderOfflineSection(album, coverage)
+  } catch (err) {
+    if (!slot.isConnected) return
+    slot.innerHTML = `<p class="offline-note">读不到本地缓存状态：${esc(err.message)}</p>`
+    const hint = $('#offline-hint', el.drawerBody)
+    if (hint) hint.textContent = ''
+  }
+}
+
+function renderOfflineSection(album, cov) {
+  const slot = $('#offline-body', el.drawerBody)
+  if (!slot) return
+  const hint = $('#offline-hint', el.drawerBody)
+  const known = (cov?.chapters || []).length
+
+  if (!cov || !known) {
+    if (hint) hint.textContent = '未缓存'
+    slot.innerHTML = `<p class="offline-note">还没在阅读器里看过这部作品。看过的页会自动存到本机——整本看完后，这里会变成「直接导出 PDF」，一页都不用重新下载。</p>`
+    return
+  }
+
+  const total = cov.total || known
+  // 进度按「每章各自的完成度」加权：只看完一章的第 8/10 页，也比直接显示 0% 诚实
+  const progress = (cov.chapters || []).reduce(
+    (n, c) => n + (c.pages ? Math.min(1, c.cached / c.pages) : 0),
+    0,
+  )
+  const pct = total ? Math.min(100, Math.round((progress / total) * 100)) : 0
+  if (hint) hint.textContent = cov.complete ? '整本已缓存' : `已看 ${pct}%`
+
+  const tooBig = state.split === 'single' && cov.pages > MERGE_LIMIT
+
+  slot.innerHTML = `
+    <div class="offline-meter" title="整本缓存进度"><i style="width:${pct}%"></i></div>
+    <p class="offline-line">
+      <b>${cov.chaptersCached}/${total}</b> 章看完 · ${fmtNum(cov.pagesCached)}/${fmtNum(cov.pages)} 页（已打开的章节）
+      · ${fmtSize(cov.size)}
+      ${cov.complete ? '<span class="offline-tag ok">整本已在本机</span>' : `<span class="offline-tag">还差 ${Math.max(0, total - cov.chaptersCached)} 章</span>`}
+    </p>
+    ${
+      cov.complete
+        ? '<p class="offline-note ok">整本已经在硬盘上了，导出只做排版：不联网、不再消耗流量。</p>'
+        : '<p class="offline-note">没看完的章节导出时会照常联网补下，<b>看过的页不会重复下载</b>。</p>'
+    }
+    ${tooBig ? `<p class="offline-note warn">整本 ${fmtNum(cov.pages)} 页，超过单文件 350 页上限，请先选「每章一个 PDF 打包」。</p>` : ''}
+    <div class="offline-actions">
+      ${
+        cov.complete
+          ? `<button class="btn primary" id="btn-offline" ${tooBig ? 'disabled' : ''}>导出 PDF（本地）</button>`
+          : `<button class="btn ghost" id="btn-offline-partial">用缓存导出（补下剩余页）</button>
+             <button class="btn ghost" id="btn-offline-read">继续阅读</button>`
+      }
+    </div>`
+
+  $('#btn-offline', slot)?.addEventListener('click', () => void startOfflineJob(album))
+  $('#btn-offline-partial', slot)?.addEventListener('click', () => startJob())
+  $('#btn-offline-read', slot)?.addEventListener('click', () => {
+    const first = (cov.chapters || []).find((c) => !c.complete)
+    openReader(album.id, first?.sort || state.from)
+  })
+}
+
+async function startOfflineJob(album) {
+  if (state.encrypt === 'custom' && !String(state.password || '').trim()) {
+    toast('请先填写自定义密码', 'err')
+    $('#pdf-password', el.drawerBody)?.focus()
+    return
+  }
+
+  const btn = $('#btn-offline', el.drawerBody)
+  if (btn) {
+    btn.disabled = true
+    btn.textContent = '创建任务…'
+  }
+
+  const list = selectedChapters()
+  const whole = list.length === album.series.length
+
+  try {
+    const { job } = await api('/api/jobs', {
+      method: 'POST',
+      timeout: 20000,
+      body: {
+        id: album.id,
+        source: 'cache',
+        whole,
+        from: whole ? undefined : state.from,
+        to: whole ? undefined : state.to,
+        mode: state.split,
+        encrypt: state.encrypt,
+        password: state.password,
+      },
+    })
+    trackJob(job)
+    openTasks()
+    closeDrawer()
+    toast('正在用本地缓存排版 PDF，不消耗流量', 'ok')
+  } catch (err) {
+    toast(err.message, 'err')
+    if (btn) {
+      btn.disabled = false
+      btn.textContent = '导出 PDF（本地）'
+    }
+  }
+}
 
 function closeDrawer() {
   el.drawer.classList.remove('open')
@@ -1171,10 +1306,16 @@ function renderJobs() {
   const jobs = [...state.jobs.values()].sort((a, b) => b.createdAt - a.createdAt)
   const cacheItems = (state.cacheItems || []).slice(0, 60)
   const groups = buildGroups(jobs, cacheItems)
+  const ready = state.offlineItems || []
 
-  el.tasksBody.innerHTML = groups.length
-    ? groups.map(renderGroup).join('')
-    : `<div class="empty" style="padding:34px 18px"><p>还没有任务</p></div>`
+  const readyHtml = ready.length ? renderOfflineReady(ready) : ''
+  el.tasksBody.innerHTML = readyHtml + (
+    groups.length
+      ? groups.map(renderGroup).join('')
+      : ready.length
+        ? ''
+        : `<div class="empty" style="padding:34px 18px"><p>还没有任务</p></div>`
+  )
 
   const active = jobs.some((j) => j.status === 'queued' || j.status === 'running')
   el.taskBadge.hidden = !active
@@ -1254,6 +1395,58 @@ function buildGroups(jobs, cacheItems) {
     .sort((a, b) => b.time - a.time)
 }
 
+/**
+ * 任务面板顶部的「整本已缓存」：读完整本的作品在这里就能直接出 PDF，
+ * 不用再去点「开始生成」——它其实就是已经下载好的东西，只是还没排版。
+ */
+function renderOfflineReady(items) {
+  return `<div class="offline-ready">
+    <div class="offline-ready-head">整本已缓存 · 点一下就能导出 PDF（不消耗流量）</div>
+    ${items
+      .map(
+        (it) => `<div class="offline-ready-row">
+          <div class="offline-ready-main">
+            <b title="${esc(it.name)}">${esc(it.name)}</b>
+            <span>JM${esc(it.id)} · ${it.chapters} 章 · ${fmtNum(it.pages)} 页 · ${fmtSize(it.size)}</span>
+          </div>
+          <button class="btn ghost" type="button" data-offline-export="${esc(it.id)}">导出 PDF</button>
+        </div>`,
+      )
+      .join('')}
+  </div>`
+}
+
+/** 从任务面板直接离线导出：默认按配置的加密方式，页数超上限就自动分章打包。 */
+async function exportOfflineItem(id) {
+  const it = (state.offlineItems || []).find((x) => String(x.id) === String(id))
+  if (!it) return
+  const encrypt = state.config?.encrypt || 'none'
+  const password = state.config?.password || ''
+  const mode = it.pages > MERGE_LIMIT ? 'zip' : 'single'
+  try {
+    const { job } = await api('/api/jobs', {
+      method: 'POST',
+      timeout: 20000,
+      body: { id: it.id, source: 'cache', whole: true, mode, encrypt, password },
+    })
+    trackJob(job)
+    toast(`《${it.name}》正在用本地缓存排版`, 'ok')
+    void loadOfflineItems()
+  } catch (err) {
+    toast(err.message, 'err')
+  }
+}
+
+async function loadOfflineItems() {
+  try {
+    const { items } = await api('/api/offline', { timeout: 12000 })
+    state.offlineItems = (items || []).filter((it) => it.complete)
+  } catch {
+    state.offlineItems = []
+  }
+  if (el.tasks.classList.contains('open')) renderJobs()
+}
+
 /** 组内条目的章节标签。 */
 function chapterLabel(e) {
   if (e.job) {
@@ -1321,7 +1514,9 @@ function renderJob(j) {
     error: ['失败', 'err'],
     canceled: ['已取消', ''],
   }
-  const [label, cls] = statusMap[j.status] || [j.status, '']
+  let [label, cls] = statusMap[j.status] || [j.status, '']
+  // 离线导出没有「下载」这一步，说标注一下更准确
+  if (j.status === 'running' && j.source === 'cache') label = '排版中'
   const percent = j.status === 'done' ? 100 : j.percent || 0
   const indeterminate = j.status === 'queued' || (j.status === 'running' && !j.total)
   const sub =
@@ -1352,7 +1547,7 @@ function renderJob(j) {
     <div class="job-top">
       <div class="job-name" title="${esc(j.title)}">${esc(chapterLabel({ job: j }))}${
         j.kind === 'zip' ? '<span class="job-tag">ZIP</span>' : ''
-      }</div>
+      }${j.source === 'cache' ? '<span class="job-tag local">本地</span>' : ''}</div>
       <div class="job-state ${cls}">${label}</div>
     </div>
     ${j.status === 'done' ? '' : `<div class="bar ${indeterminate ? 'indeterminate' : ''}"><i style="width:${percent}%"></i></div>`}
@@ -1389,6 +1584,7 @@ function updateStats() {
 function openTasks() {
   el.tasks.classList.add('open')
   el.tasks.setAttribute('aria-hidden', 'false')
+  void loadOfflineItems() // 打开时刷新「整本已缓存」，刚看完的作品会立刻出现在最上面
 }
 function closeTasks() {
   el.tasks.classList.remove('open')
@@ -1403,6 +1599,11 @@ el.tasksBody.addEventListener('click', (e) => {
   const readBtn = e.target.closest('[data-read]')
   if (readBtn) {
     openReader(readBtn.dataset.read, Number(readBtn.dataset.chapter))
+    return
+  }
+  const exportBtn = e.target.closest('[data-offline-export]')
+  if (exportBtn) {
+    void exportOfflineItem(exportBtn.dataset.offlineExport)
     return
   }
   const head = e.target.closest('.group-head')
@@ -1519,6 +1720,10 @@ async function openReader(albumId, sort, { fromHistory = false } = {}) {
 
   const wasOpen = state.reader.open
   state.reader.open = true
+  if (state.reader.albumId !== id) {
+    state.reader.offline = null // 换作品时先清掉上一本的覆盖率，别让角标串台
+    el.readerCache.hidden = true
+  }
   state.reader.albumId = id
   showReader()
   applyReaderWidth(store.get(READ_WIDTH_KEY) || 'fit')
@@ -1636,21 +1841,101 @@ function renderReaderHeader(data) {
   el.readerPrevCh.title = prev ? `第 ${prev.sort} 章 · ${prev.name}` : '已经是第一章'
   el.readerNextCh.title = next ? `第 ${next.sort} 章 · ${next.name}` : '已经是最后一章'
 
+  renderReaderEnd()
+  void refreshReaderOffline()
+}
+
+/** 章节末尾那块：下一章 / 整本已缓存时直接导出 / 回到开头。 */
+function renderReaderEnd() {
+  const r = state.reader
+  const sort = Number(r.sort)
+  const idx = r.chapters.findIndex((s) => Number(s.sort) === sort)
+  const cur = idx >= 0 ? r.chapters[idx] : null
+  const next = idx >= 0 && idx < r.chapters.length - 1 ? r.chapters[idx + 1] : null
+  const cov = r.offline
+  const complete = !!cov?.complete
+  const last = !next
+
   el.readerEnd.hidden = false
   el.readerEnd.innerHTML = `
-    <p>第 ${c.sort} 章 · ${esc(c.name)} · 已读完</p>
+    <p>第 ${sort} 章${cur?.name ? ` · ${esc(cur.name)}` : ''} · 已读完</p>
+    ${next ? `<button class="btn primary" data-next="${next.sort}">继续阅读 第 ${next.sort} 章</button>` : ''}
+    ${last && complete ? `<button class="btn primary" data-offline="1">整本已缓存 · 导出 PDF</button>` : ''}
+    ${last && !complete ? '<p style="opacity:.6">已经是最后一章了</p>' : ''}
     ${
-      next
-        ? `<button class="btn primary" data-next="${next.sort}">继续阅读 第 ${next.sort} 章</button>`
-        : '<p style="opacity:.6">已经是最后一章了</p>'
+      complete && next
+        ? `<p class="reader-offline-note">整本 ${cov.total} 章都已在本地，随时可以在详情页直接导出 PDF</p>`
+        : ''
     }
     <button class="btn ghost" data-top="1">回到开头</button>`
+
   el.readerEnd.querySelector('[data-next]')?.addEventListener('click', (e) => {
     loadReaderChapter(Number(e.currentTarget.dataset.next))
   })
+  el.readerEnd.querySelector('[data-offline]')?.addEventListener('click', () => void exportOfflineFromReader())
   el.readerEnd.querySelector('[data-top]')?.addEventListener('click', () => {
     el.readerScroll.scrollTo({ top: 0, behavior: 'smooth' })
   })
+}
+
+/** 阅读器里的「整本已缓存 → 导出」：页数少就合成一本，多了自动分章打包。 */
+async function exportOfflineFromReader() {
+  const r = state.reader
+  const cov = r.offline
+  if (!cov?.complete) return
+  const mode = cov.pages > MERGE_LIMIT ? 'zip' : 'single'
+  try {
+    const { job } = await api('/api/jobs', {
+      method: 'POST',
+      timeout: 20000,
+      body: {
+        id: r.albumId,
+        source: 'cache',
+        whole: true,
+        mode,
+        encrypt: state.encrypt || 'none',
+        password: state.password || '',
+      },
+    })
+    closeReader()
+    trackJob(job)
+    openTasks()
+    toast(mode === 'zip' ? '整本已缓存，正在分章打包（不消耗流量）' : '整本已缓存，正在排版 PDF（不消耗流量）', 'ok')
+  } catch (err) {
+    toast(err.message, 'err')
+  }
+}
+
+/**
+ * 刷新阅读器上的「本地 x/y 章」标记。整本刚好看完时顺手把导出按钮塞进章末，
+ * 并提示一次——这就是「读完了自动变成已下载」的时刻。
+ */
+async function refreshReaderOffline() {
+  const r = state.reader
+  const albumId = r.albumId
+  if (!albumId) return
+  const wasComplete = !!r.offline?.complete
+  try {
+    const { coverage } = await api(`/api/offline?id=${encodeURIComponent(albumId)}`, { timeout: 10000 })
+    if (r.albumId !== albumId || !r.open) return
+    r.offline = coverage
+
+    const known = coverage?.chapters?.length || 0
+    const full = !!coverage?.complete
+    el.readerCache.hidden = !known
+    el.readerCache.textContent = !known ? '' : full ? '整本已缓存' : `本地 ${coverage.chaptersCached}/${coverage.total} 章`
+    el.readerCache.classList.toggle('full', full)
+    el.readerCache.title = full
+      ? '整本都在这台机器上，可以直接导出 PDF'
+      : '看过的页已存到本机，导出 PDF 时不会重复下载'
+
+    if (full && !wasComplete) {
+      toastOnce(`《${el.readerTitle.textContent}》整本已缓存，可直接导出 PDF`, 'ok')
+      renderReaderEnd()
+    }
+  } catch {
+    /* 覆盖率只是个提示，拿不到就当没有缓存 */
+  }
 }
 
 function renderReaderPages() {
@@ -1787,6 +2072,8 @@ function teardownReader() {
   r.token++
   if (r.sort != null) saveReadProgress(r.albumId, { sort: r.sort, page: r.current })
   r.open = false
+  r.offline = null
+  el.readerCache.hidden = true
   r.observer?.disconnect()
   r.posObserver?.disconnect()
   clearTimeout(r.saveTimer)

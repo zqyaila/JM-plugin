@@ -37,6 +37,9 @@ const MB = 1024 * 1024
 
 export function createPageStore({ dir, limitMB = 512 } = {}) {
   const chapters = new Map() // cid -> { pages: Map<p, meta>, size, mtime, loaded }
+  // 整本读完的章节会被「软钉住」：淘汰时排在最后。否则读一本 300 页的漫画，
+  // 读到最后一章时第一章早就被 LRU 踢掉，「整本缓存」永远凑不齐。
+  const pinned = new Set()
   let totalBytes = 0
   let limitBytes = toBytes(limitMB)
   let ready = null
@@ -243,6 +246,25 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
     return out
   }
 
+  /** 这一章已落盘的页码（升序）。「整本是否缓存完」就是靠它逐章核对的。 */
+  async function pageNumbers(cid) {
+    const entry = await loadChapter(String(cid))
+    return [...entry.pages.keys()].sort((a, b) => a - b)
+  }
+
+  async function chapterSize(cid) {
+    const entry = await loadChapter(String(cid))
+    return entry.size
+  }
+
+  function pin(cids) {
+    for (const cid of cids || []) pinned.add(String(cid))
+  }
+
+  function unpin(cids) {
+    for (const cid of cids || []) pinned.delete(String(cid))
+  }
+
   async function removeChapter(cid) {
     const key = String(cid)
     const entry = chapters.get(key)
@@ -265,7 +287,13 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
     try {
       const list = [...chapters.entries()]
         .filter(([id, e]) => id !== String(keepCid) && e.loaded && e.pages.size)
-        .sort((a, b) => a[1].mtime - b[1].mtime)
+        // 先扔没钉住的；全钉住了才动「已读完的整本」，不至于把上限彻底架空
+        .sort((a, b) => {
+          const pa = pinned.has(a[0]) ? 1 : 0
+          const pb = pinned.has(b[0]) ? 1 : 0
+          if (pa !== pb) return pa - pb
+          return a[1].mtime - b[1].mtime
+        })
       for (const [id] of list) {
         if (totalBytes <= limitBytes * 0.9) break
         await removeChapter(id)
@@ -284,6 +312,7 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
       size: totalBytes,
       limit: limitBytes,
       limitMB: limitBytes ? Number((limitBytes / MB).toFixed(limitBytes < MB ? 1 : 0)) : 0,
+      pinned: pinned.size,
     }
   }
 
@@ -292,6 +321,7 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
     indexTimers.clear()
     await fsp.rm(dir, { recursive: true, force: true })
     chapters.clear()
+    pinned.clear()
     totalBytes = 0
     await fsp.mkdir(dir, { recursive: true })
   }
@@ -303,7 +333,20 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
 
   void init()
 
-  return { get, put, dims, stats, clear, setLimitMB, init, removeChapter }
+  return {
+    get,
+    put,
+    dims,
+    pageNumbers,
+    chapterSize,
+    pin,
+    unpin,
+    stats,
+    clear,
+    setLimitMB,
+    init,
+    removeChapter,
+  }
 }
 
 export default createPageStore
