@@ -89,6 +89,8 @@ const el = {
   tasksClose: $('#tasks-close'),
   btnTasks: $('#btn-tasks'),
   btnSettings: $('#btn-settings'),
+  btnFavorites: $('#btn-favorites'),
+  favBadge: $('#fav-badge'),
   taskBadge: $('#task-badge'),
   modalScrim: $('#modal-scrim'),
   settings: $('#settings'),
@@ -151,6 +153,8 @@ const state = {
   encrypt: 'none',
   password: '',
   config: null,
+  view: 'search', // search | favorites：决定「取消收藏」后是删卡片还是留在原地
+  favorites: new Map(), // id -> { id, name, author, time }
   jobs: new Map(),
   cacheItems: [],
   cacheSig: '',
@@ -399,6 +403,9 @@ function renderEmpty(text, showChips = false) {
   el.empty.hidden = false
   el.emptyText.textContent = text
   el.chips.hidden = !showChips
+  // 三步引导只属于「还没搜过」的首页，收藏夹空了不该再教人怎么搜索
+  const steps = $('.steps', el.empty)
+  if (steps) steps.hidden = false
 }
 
 function renderGrid(items, meta) {
@@ -412,13 +419,17 @@ function renderGrid(items, meta) {
   el.grid.innerHTML = items
     .map(
       (it, i) => `
-      <article class="card" data-id="${esc(it.id)}" style="animation-delay:${Math.min(i * 22, 320)}ms">
+      <article class="card" data-id="${esc(it.id)}" data-name="${esc(it.name)}" data-author="${esc(it.author || '')}"
+               style="animation-delay:${Math.min(i * 22, 320)}ms">
         <span class="card-id">JM${esc(it.id)}</span>
+        <button class="card-fav ${isFavorite(it.id) ? 'on' : ''}" data-fav="${esc(it.id)}" type="button"
+                title="${isFavorite(it.id) ? '取消收藏' : '收藏'}" aria-pressed="${isFavorite(it.id)}"
+                aria-label="收藏">${HEART_SVG}</button>
         <img src="${esc(withToken(it.cover))}" alt="" loading="lazy" decoding="async"
              onerror="this.style.opacity='.25';this.removeAttribute('src')" />
         <div class="card-body">
           <div class="card-title">${esc(it.name)}</div>
-          <div class="card-author">${esc(it.author || '佚名')}</div>
+          <div class="card-author">${esc(it.author || '佚名')}${it.note ? ` · ${esc(it.note)}` : ''}</div>
         </div>
       </article>`,
     )
@@ -433,6 +444,7 @@ async function doSearch(q, page = 1) {
   }
   state.query = query
   state.page = page
+  state.view = 'search'
   const token = ++state.seq
   document.body.classList.add('searching')
   renderSkeletons()
@@ -490,12 +502,191 @@ el.chips.addEventListener('click', (e) => {
 })
 
 el.grid.addEventListener('click', (e) => {
+  const favBtn = e.target.closest('.card-fav')
+  if (favBtn) {
+    e.preventDefault()
+    e.stopPropagation()
+    const card = favBtn.closest('.card')
+    if (card) toggleFavorite({ id: card.dataset.id, name: card.dataset.name, author: card.dataset.author })
+    return
+  }
   const card = e.target.closest('.card')
   if (card) openDetail(card.dataset.id)
 })
 
 el.prev.addEventListener('click', () => doSearch(state.query, Math.max(1, state.page - 1)))
 el.next.addEventListener('click', () => doSearch(state.query, Math.min(state.totalPages, state.page + 1)))
+
+// ---------------------------------------------------------------------------
+// 收藏（本地收藏夹，存在服务端 data/favorites.json）
+// ---------------------------------------------------------------------------
+
+const HEART_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+  '<path d="M12 20.2S4.8 15.6 4.8 10.6a4.2 4.2 0 0 1 7.2-2.9 4.2 4.2 0 0 1 7.2 2.9c0 5-7.2 9.6-7.2 9.6Z" ' +
+  'stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>'
+
+const isFavorite = (id) => state.favorites.has(String(id || ''))
+
+/** 收藏数挂在顶栏图标上，0 时藏起来，免得空收藏夹也挂个「0」。 */
+function refreshFavBadge() {
+  const n = state.favorites.size
+  if (el.favBadge) {
+    el.favBadge.hidden = n === 0
+    el.favBadge.textContent = n > 99 ? '99+' : String(n)
+  }
+  if (el.btnFavorites) el.btnFavorites.title = n ? `我的收藏（${n}）` : '我的收藏'
+}
+
+/** 把某一部作品的收藏状态同步到所有已经渲染出来的按钮上。 */
+function syncFavoriteUI(id) {
+  const key = String(id)
+  const on = state.favorites.has(key)
+  $$(`.card-fav[data-fav="${key}"]`).forEach((btn) => {
+    btn.classList.toggle('on', on)
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false')
+    btn.title = on ? '取消收藏' : '收藏'
+  })
+  const btn = $('#btn-fav', el.drawerBody)
+  if (btn && btn.dataset.id === key) {
+    btn.classList.toggle('on', on)
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false')
+    btn.innerHTML = `${HEART_SVG}<span>${on ? '已收藏' : '收藏'}</span>`
+  }
+  refreshFavBadge()
+}
+
+const favBusy = new Set()
+
+/**
+ * 收藏 / 取消收藏。先改界面再发请求，点一下立刻有反馈；
+ * 失败就回滚，绝不留下「看着收藏了、其实没存上」的假状态。
+ */
+async function toggleFavorite(item) {
+  const id = String(item?.id || '')
+  if (!id || favBusy.has(id)) return
+
+  const prev = state.favorites.get(id)
+  const adding = !prev
+  favBusy.add(id)
+
+  if (adding) {
+    state.favorites.set(id, { id, name: item.name || '', author: item.author || '', time: Date.now() })
+  } else {
+    state.favorites.delete(id)
+  }
+  syncFavoriteUI(id)
+
+  try {
+    if (adding) {
+      const r = await api('/api/favorites', {
+        method: 'POST',
+        body: { id, name: item.name || '', author: item.author || '', totalPages: item.totalPages || 0 },
+        timeout: 20000,
+      })
+      if (r.item) state.favorites.set(id, r.item) // 收藏时间以服务端为准
+      syncFavoriteUI(id)
+      toast('已加入收藏', 'ok')
+    } else {
+      await api(`/api/favorites/${id}`, { method: 'DELETE', timeout: 15000 })
+      toast('已取消收藏')
+    }
+
+    if (state.view === 'favorites') {
+      if (adding) renderFavorites()
+      else removeFavoriteCard(id)
+    }
+  } catch (err) {
+    if (adding) state.favorites.delete(id)
+    else if (prev) state.favorites.set(id, prev)
+    syncFavoriteUI(id)
+    toast(err.message || '收藏操作失败', 'err')
+  } finally {
+    favBusy.delete(id)
+  }
+}
+
+/** 收藏页里取消收藏：只拿掉这一张卡片，不整页重排（避免滚动位置跳走）。 */
+function removeFavoriteCard(id) {
+  const card = $(`.card[data-id="${id}"]`, el.grid)
+  if (!card) return
+  card.style.transition = 'opacity .2s var(--ease), transform .2s var(--ease)'
+  card.style.opacity = '0'
+  card.style.transform = 'scale(.95)'
+  setTimeout(() => {
+    card.remove()
+    const left = el.grid.querySelectorAll('.card').length
+    if (!left) return renderFavorites()
+    el.resultsMeta.textContent = `共 ${state.favorites.size} 部 · 点心形可取消`
+  }, 200)
+}
+
+function renderFavorites() {
+  state.view = 'favorites'
+  state.query = ''
+
+  const items = [...state.favorites.values()]
+    .sort((a, b) => (b.time || 0) - (a.time || 0))
+    .map((f) => {
+      const prog = readProgressOf(f.id)
+      return {
+        id: f.id,
+        name: f.name || `JM${f.id}`,
+        author: f.author || '',
+        cover: `/api/cover?id=${f.id}&v=0`,
+        note: prog && prog.sort ? `读到第 ${prog.sort} 章` : '',
+      }
+    })
+
+  const total = state.favorites.size
+  const shown = items.slice(0, 200)
+
+  if (!items.length) {
+    renderEmpty('收藏夹还是空的。搜索结果里点封面右上角的心形，或在详情页点「收藏」。')
+    const steps = $('.steps', el.empty)
+    if (steps) steps.hidden = true
+    el.resultsHead.hidden = false
+    el.resultsTitle.textContent = '我的收藏'
+    el.resultsMeta.textContent = '共 0 部'
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+    return
+  }
+
+  renderGrid(shown, {
+    title: '我的收藏',
+    sub:
+      total > shown.length
+        ? `共 ${total} 部，只显示最近 ${shown.length} 部`
+        : `共 ${total} 部 · 点心形可取消`,
+  })
+  el.pager.hidden = true
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+function applyFavorites(list) {
+  state.favorites = new Map((Array.isArray(list) ? list : []).map((it) => [String(it.id), it]))
+  refreshFavBadge()
+  // 首屏可能已经渲染过卡片（缓存/任务面板），把心形状态补上
+  $$('.card-fav').forEach((btn) => {
+    const on = state.favorites.has(btn.dataset.fav)
+    btn.classList.toggle('on', on)
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false')
+    btn.title = on ? '取消收藏' : '收藏'
+  })
+}
+
+el.btnFavorites?.addEventListener('click', async () => {
+  // 先用手上这份渲染，别让人对着空白等网络
+  renderFavorites()
+  try {
+    const r = await api('/api/favorites', { timeout: 8000 })
+    const before = state.favorites.size
+    applyFavorites(r.items)
+    if (state.view === 'favorites' && state.favorites.size !== before) renderFavorites()
+  } catch {
+    /* 拉不到就继续用本地这份 */
+  }
+})
 
 // ---------------------------------------------------------------------------
 // 详情抽屉
@@ -548,6 +739,10 @@ function renderDetail(album) {
     album.totalPages ? `<span class="pill">约 ${album.totalPages} 页</span>` : '',
     album.likes ? `<span class="pill">${fmtNum(album.likes)} 赞</span>` : '',
     album.totalViews ? `<span class="pill">${fmtNum(album.totalViews)} 浏览</span>` : '',
+    `<button class="fav-toggle ${isFavorite(album.id) ? 'on' : ''}" id="btn-fav" data-id="${esc(album.id)}"
+             type="button" aria-pressed="${isFavorite(album.id)}">${HEART_SVG}<span>${
+               isFavorite(album.id) ? '已收藏' : '收藏'
+             }</span></button>`,
   ]
     .filter(Boolean)
     .join('')
@@ -685,6 +880,15 @@ function renderDetail(album) {
     desc.style.cursor = 'pointer'
     desc.addEventListener('click', () => desc.classList.toggle('expanded'))
   }
+
+  $('#btn-fav', el.drawerBody)?.addEventListener('click', () => {
+    toggleFavorite({
+      id: album.id,
+      name: album.name,
+      author: (album.authors || [])[0] || '',
+      totalPages: album.totalPages,
+    })
+  })
 
   $('#btn-build', el.drawerBody).addEventListener('click', startJob)
 
@@ -1795,10 +1999,11 @@ async function warmUp() {
   setStat(el.statCache, '…')
   setStat(el.statProxy, '…')
 
-  const [cfg, jobRes, cacheRes] = await Promise.allSettled([
+  const [cfg, jobRes, cacheRes, favRes] = await Promise.allSettled([
     api('/api/config', { timeout: 6000 }),
     api('/api/jobs', { timeout: 6000 }),
     api('/api/cache', { timeout: 8000 }),
+    api('/api/favorites', { timeout: 8000 }),
   ])
 
   if (cfg.status === 'fulfilled') {
@@ -1821,6 +2026,9 @@ async function warmUp() {
   else setStat(el.statJobs, '—', 'warn')
   if (cacheRes.status === 'fulfilled') applyCache(cacheRes.value)
   else setStat(el.statCache, '—', 'warn')
+
+  // 收藏拉不到不影响主流程，只是心形状态为空
+  if (favRes.status === 'fulfilled') applyFavorites(favRes.value.items)
 }
 
 async function boot() {

@@ -25,6 +25,7 @@ import { proxyRequest, testProxy, parseProxyList, maskProxy } from '../apps/prox
 import { config, loadConfig, saveConfig, publicConfig, resolveServerOptions, DATA_DIR } from './config.js'
 import { createJobManager } from './jobs.js'
 import { createPageStore } from './pagecache.js'
+import { createFavorites } from './favorites.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC_DIR = path.join(__dirname, 'public')
@@ -432,6 +433,8 @@ const pageStore = createPageStore({
   dir: path.join(DATA_DIR, 'pages'),
   limitMB: config.pageCacheMB,
 })
+// 本地收藏夹：不依赖 JM 账号，存 data/favorites.json
+const favorites = createFavorites({ file: path.join(DATA_DIR, 'favorites.json') })
 const pageCache = new Map() // `${chapterId}:${p}` -> { buf, type, etag, time }
 let pageCacheBytes = 0
 
@@ -1001,6 +1004,49 @@ async function handleProxyTest(req, res) {
 }
 
 // ---------------------------------------------------------------------------
+// 收藏
+// ---------------------------------------------------------------------------
+
+/** 收藏列表：只回轻量字段，封面由前端按 id 现取（服务端有封面缓存）。 */
+async function handleFavoritesList(res) {
+  const items = await favorites.list()
+  sendJson(res, 200, {
+    ok: true,
+    total: items.length,
+    items: items.map((it) => ({ ...it, cover: `/api/cover?id=${it.id}&v=0` })),
+  })
+}
+
+async function handleFavoriteAdd(req, res) {
+  const body = await readJsonBody(req)
+  const id = normalizeAlbumId(body.id)
+  if (!id) return sendError(res, 400, 'JM 号不合法')
+
+  let name = String(body.name || '').trim()
+  let author = String(body.author || '').trim()
+  let totalPages = Number(body.totalPages) || 0
+
+  // 从卡片/详情加的时候前端已经带了名字；只有直接调接口才回源补全
+  if (!name) {
+    await ensureClient()
+    const d = await repo.getAlbum(id)
+    name = d.name || `JM${id}`
+    author = (d.authors || [])[0] || ''
+    totalPages = totalPages || Number(d.totalPhotos) || 0
+  }
+
+  const item = await favorites.add({ id, name, author, totalPages, sort: Number(body.sort) || 0 })
+  sendJson(res, 200, { ok: true, item, total: (await favorites.stats()).total })
+}
+
+async function handleFavoriteRemove(url, res, raw) {
+  const id = normalizeAlbumId(raw ?? url.searchParams.get('id'))
+  if (!id) return sendError(res, 400, 'JM 号不合法')
+  const removed = await favorites.remove(id)
+  sendJson(res, 200, { ok: true, removed, id, total: (await favorites.stats()).total })
+}
+
+// ---------------------------------------------------------------------------
 // 路由
 // ---------------------------------------------------------------------------
 
@@ -1037,6 +1083,12 @@ async function handleApi(req, res, url) {
     if (method === 'GET' && p === '/cover') return await handleCover(url, res)
     if (method === 'GET' && p === '/read') return await handleRead(url, res)
     if (method === 'GET' && p === '/page') return await handlePage(url, req, res)
+
+    if (method === 'GET' && p === '/favorites') return await handleFavoritesList(res)
+    if (method === 'POST' && p === '/favorites') return await handleFavoriteAdd(req, res)
+    if (method === 'DELETE' && p.startsWith('/favorites')) {
+      return await handleFavoriteRemove(url, res, p.split('/')[2])
+    }
 
     if (method === 'POST' && p === '/jobs') return await handleCreateJob(req, res)
     if (method === 'GET' && p === '/jobs') return sendJson(res, 200, { ok: true, jobs: jobs.list() })

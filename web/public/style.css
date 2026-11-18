@@ -180,6 +180,25 @@ a { color: inherit; text-decoration: none; }
 }
 @keyframes pulse { 50% { opacity: 0.45; } }
 
+/* 收藏数量：小胶囊，比纯红点多一个「有多少」 */
+.badge-count {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  border-radius: 999px;
+}
+
 /* ---------- 主区域 ---------- */
 
 .main {
@@ -319,6 +338,36 @@ body[data-offline='1'] .stat {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.card-fav {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9px;
+  background: rgba(8, 8, 12, 0.62);
+  color: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(6px);
+  opacity: 0;
+  transform: translateY(-3px);
+  transition: 0.18s var(--ease);
+}
+.card:hover .card-fav,
+.card-fav:focus-visible,
+.card-fav.on { opacity: 1; transform: none; }
+.card-fav svg { width: 16px; height: 16px; }
+.card-fav:hover { color: #fff; border-color: rgba(255, 77, 109, 0.6); background: rgba(255, 77, 109, 0.24); }
+.card-fav.on { color: var(--accent); border-color: rgba(255, 77, 109, 0.5); background: rgba(255, 77, 109, 0.16); }
+.card-fav.on svg { fill: currentColor; }
+/* 触屏没有 hover，收藏按钮必须常显 */
+@media (hover: none) {
+  .card-fav { opacity: 1; transform: none; }
+}
+
 .card-id {
   position: absolute;
   top: 9px;
@@ -490,7 +539,7 @@ body[data-offline='1'] .stat {
   letter-spacing: -0.02em;
 }
 .detail-author { margin: 0 0 10px; font-size: 13px; color: var(--text-dim); }
-.detail-badges { display: flex; gap: 6px; flex-wrap: wrap; }
+.detail-badges { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .pill {
   padding: 4px 9px;
   font-size: 11px;
@@ -500,6 +549,25 @@ body[data-offline='1'] .stat {
   border-radius: 999px;
 }
 .pill.accent { color: var(--accent); background: var(--accent-soft); border-color: rgba(255, 77, 109, 0.3); }
+
+/* 详情里的收藏开关：跟 pill 同排，但可点 */
+.fav-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px 4px 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  transition: 0.18s var(--ease);
+}
+.fav-toggle svg { width: 13px; height: 13px; }
+.fav-toggle:hover { color: var(--text); border-color: rgba(255, 77, 109, 0.5); }
+.fav-toggle.on { color: var(--accent); background: var(--accent-soft); border-color: rgba(255, 77, 109, 0.35); }
+.fav-toggle.on svg { fill: currentColor; }
 
 .detail-desc {
   margin: 0;
