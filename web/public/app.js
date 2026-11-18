@@ -109,11 +109,10 @@ const el = {
   setPassword: $('#set-password'),
   testProxy: $('#btn-test-proxy'),
   testResult: $('#test-result'),
-  authScrim: $('#auth-scrim'),
-  auth: $('#auth'),
-  authInput: $('#auth-input'),
-  authSubmit: $('#auth-submit'),
-  authError: $('#auth-error'),
+  authwall: $('#authwall'),
+  authwallInput: $('#authwall-input'),
+  authwallMsg: $('#authwall-msg'),
+  setTokens: $('#set-tokens'),
   toasts: $('#toasts'),
   statCache: $('#stat-cache'),
   statJobs: $('#stat-jobs'),
@@ -142,7 +141,8 @@ const el = {
 
 const state = {
   token: store.get('jm-token') || '',
-  authOpen: false,
+  authOpen: false, // 口令墙是否正在前台
+  authBusy: false,
   query: '',
   page: 1,
   totalPages: 1,
@@ -219,6 +219,12 @@ function toastOnce(message, type = '') {
 // 而不是让三个统计数字一直停在「–」。
 const DEFAULT_TIMEOUT = 15000
 
+/**
+ * 口令要同时放 header 时才用这个：header 只接受 ISO-8859-1，
+ * 中文 / emoji 口令直接写进去会让 fetch 当场抛错。这类口令走 query 就够了。
+ */
+const tokenHeader = (t) => (/^[\x20-\x7e]+$/.test(t) ? { 'x-token': t } : {})
+
 async function api(path, { method = 'GET', body, timeout = DEFAULT_TIMEOUT } = {}) {
   const url = new URL(path, location.origin)
   if (state.token) url.searchParams.set('token', state.token)
@@ -232,7 +238,7 @@ async function api(path, { method = 'GET', body, timeout = DEFAULT_TIMEOUT } = {
         method,
         headers: {
           ...(body ? { 'Content-Type': 'application/json' } : {}),
-          ...(state.token ? { 'x-token': state.token } : {}),
+          ...(state.token ? tokenHeader(state.token) : {}),
         },
         body: body ? JSON.stringify(body) : undefined,
         signal: ctrl.signal,
@@ -246,27 +252,21 @@ async function api(path, { method = 'GET', body, timeout = DEFAULT_TIMEOUT } = {
 
     const data = await res.json().catch(() => ({}))
     if (res.status === 401) {
-      // 本机存的口令对不上（服务端换过口令）：先扔掉，否则之后每个请求都会
-      // 带着这个错口令再撞一次，几次刷新就把自己送进锁定名单。
+      // 本机存的口令对不上（服务端换过口令 / 把这一条删了）：先扔掉，否则之后
+      // 每个请求都会带着这个错口令再撞一次，几次刷新就把自己送进锁定名单。
       const had = !!state.token
       if (had) {
         state.token = ''
         store.remove('jm-token')
       }
-      openAuth()
-      // 告诉用户为什么突然弹窗，而不是让口令框无缘无故跳出来
-      if (had && el.authError && !el.authError.textContent.trim()) {
-        el.authError.innerHTML = '<div class="bad">本机保存的口令已失效，请重新输入</div>'
-      }
+      showAuthWall(had ? '本机保存的口令已失效，请重新输入' : '')
       throw new Error('需要访问口令')
     }
     if (res.status === 429) {
       // 被限流说明口令试错太多次。服务端对「口令正确」是立刻放行的，
-      // 所以这里仍把口令框露出来：输对一次就能当场解锁，不用干等十分钟。
+      // 所以这里仍把输入框露出来：输对一次就能当场解锁，不用干等十分钟。
       const msg = data.error || '口令错误次数过多，请稍后再试'
-      toastOnce(msg, 'err')
-      openAuth()
-      if (el.authError) el.authError.innerHTML = `<div class="bad">${esc(msg)}<br />输入正确口令可立即恢复</div>`
+      showAuthWall(`${msg}；输入正确口令可立即恢复`)
       throw new Error(msg)
     }
     if (!res.ok || data.ok === false) throw new Error(data.error || `请求失败（HTTP ${res.status}）`)
@@ -328,65 +328,142 @@ el.gateClose?.addEventListener('click', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 访问口令（服务端以 --token 启动时才会出现）
+// 访问口令墙
+//
+// 服务端可以挂多个口令（命令行 --token 甲,乙 或在设置里加）。在通过之前整页只有
+// 一个输入框：html.auth-locked 会把 body 的其它直接子元素全部隐藏，连 18+ 门禁
+// 也不露 —— 口令正确才谈得上"页面存在"。
 // ---------------------------------------------------------------------------
 
-function openAuth() {
-  if (state.authOpen) return
-  state.authOpen = true
-  el.authScrim.hidden = false
-  requestAnimationFrame(() => el.authScrim.classList.add('show'))
-  el.auth.classList.add('open')
-  el.auth.setAttribute('aria-hidden', 'false')
-  setTimeout(() => el.authInput?.focus(), 60)
+function unlockUI() {
+  document.documentElement.classList.remove('auth-locked')
+  el.authwall.hidden = true
+  el.authwallMsg.textContent = '' // 下次再锁屏时不带上一轮的「正在验证…」
+  state.authOpen = false
 }
 
-function closeAuth() {
-  state.authOpen = false
-  el.authScrim.classList.remove('show')
-  el.auth.classList.remove('open')
-  el.auth.setAttribute('aria-hidden', 'true')
+/** 显示口令墙。message 为空就只留一个输入框。 */
+function showAuthWall(message = '') {
+  // 已经在墙上时不拿空消息把现有错误擦掉（401 会并发来好几条）
+  if (state.authOpen && !message) return
+  state.authOpen = true
+  document.documentElement.classList.add('auth-locked')
+  el.authwall.hidden = false
+  el.authwallMsg.textContent = message
+  el.authwallMsg.classList.toggle('bad', !!message)
   setTimeout(() => {
-    if (!state.authOpen) el.authScrim.hidden = true
-  }, 220)
+    if (!el.authwallInput?.disabled) el.authwallInput?.focus()
+  }, 40)
+}
+
+const lockText = (sec) => `错误次数过多，约 ${Math.max(1, Math.ceil(sec / 60))} 分钟后可重试`
+
+/**
+ * 问服务端：要不要口令、手上这个对不对。
+ * /api/auth 本身不需要口令 —— 否则没口令的人连"该不该显示输入框"都不知道。
+ */
+async function authProbe(token = '') {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 8000)
+  try {
+    // 口令同时放 query 和 header：header 在 Node 里按 latin1 解，中文口令会乱码
+    const url = new URL('/api/auth', location.origin)
+    if (token) url.searchParams.set('token', token)
+    const res = await fetch(url, {
+      cache: 'no-store',
+      headers: token ? tokenHeader(token) : {},
+      signal: ctrl.signal,
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    return data
+  } catch (err) {
+    if (err?.name === 'AbortError') throw new Error('服务器 8 秒没有响应')
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 async function submitAuth() {
-  const value = el.authInput.value.trim()
+  if (state.authBusy) return
+  const value = el.authwallInput.value.trim()
   if (!value) {
-    el.authError.innerHTML = '<div class="bad">请输入口令</div>'
+    el.authwallMsg.textContent = '请输入口令'
+    el.authwallMsg.classList.add('bad')
+    el.authwallInput.focus()
     return
   }
-  const prev = state.token
-  el.authSubmit.disabled = true
-  el.authError.innerHTML = ''
-  state.token = value
+
+  state.authBusy = true
+  el.authwallInput.disabled = true
+  el.authwallMsg.textContent = '正在验证…'
+  el.authwallMsg.classList.remove('bad')
+
   try {
-    await api('/api/config', { timeout: 8000 }) // 只用于校验口令
+    const r = await authProbe(value)
+    if (r.required && !r.valid) {
+      el.authwallMsg.textContent = r.lockLeft ? lockText(r.lockLeft) : '口令不正确'
+      el.authwallMsg.classList.add('bad')
+      el.authwallInput.select()
+      return
+    }
+    state.token = value
     store.set('jm-token', value)
-    closeAuth()
-    toast('口令正确，已保存到本机', 'ok')
-    await warmUp()
+    el.authwallInput.value = ''
+    unlockUI()
+    afterAuth()
+    toast('口令正确', 'ok')
   } catch (err) {
-    state.token = prev
-    // 401 会被 api() 统一成「需要访问口令」，在弹窗里应表述为口令错误；
-    // 429（失败次数过多）等其它错误保留服务端原文，避免误导。
-    const raw = err?.message || ''
-    const msg = !raw || /需要访问口令/.test(raw) ? '口令不正确，请重试' : raw
-    el.authError.innerHTML = `<div class="bad">${esc(msg)}</div>`
-    el.authInput.select()
+    el.authwallMsg.textContent = err?.message || '验证失败，请重试'
+    el.authwallMsg.classList.add('bad')
   } finally {
-    el.authSubmit.disabled = false
+    state.authBusy = false
+    el.authwallInput.disabled = false
+    if (state.authOpen) el.authwallInput.focus()
   }
 }
 
-el.authSubmit?.addEventListener('click', submitAuth)
-el.authInput?.addEventListener('keydown', (e) => {
+el.authwallInput?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') submitAuth()
 })
 
+/** 口令通过（或本来就不需要口令）之后，才轮到 18+ 门禁和主界面。 */
+function afterAuth() {
+  el.gate.hidden = gateAccepted
+  if (gateAccepted) boot()
+}
+
+async function startApp() {
+  let info = null
+  try {
+    // 本机存过口令就一起带上，省一次往返
+    info = await authProbe(state.token)
+  } catch {
+    // 服务连不上时鉴权无从判断：先放开，让原有的「连不上后端」提示去解释
+    unlockUI()
+    afterAuth()
+    return
+  }
+
+  if (!info.required || info.valid) {
+    unlockUI()
+    afterAuth()
+    return
+  }
+
+  // 本机存的口令已经不在服务端列表里（被删掉或整体换过）
+  if (state.token) {
+    state.token = ''
+    store.remove('jm-token')
+  }
+  showAuthWall(info.lockLeft ? lockText(info.lockLeft) : '')
+}
+
 // ---------------------------------------------------------------------------
 // 搜索与列表
+// ---------------------------------------------------------------------------
+
 // ---------------------------------------------------------------------------
 
 function renderSkeletons(n = 12) {
@@ -1824,6 +1901,7 @@ function fillSettings(cfg) {
   el.setQuality.value = cfg.quality ?? 82
   el.setMaxPages.value = cfg.maxPages ?? 0
   el.setPageCache.value = cfg.pageCacheMB ?? 512
+  el.setTokens.value = (cfg.tokens || []).join('\n')
   el.setEncrypt.value = cfg.encrypt || 'none'
   el.setPassword.value = cfg.password || ''
   el.setPassword.hidden = (cfg.encrypt || 'none') !== 'custom'
@@ -1888,6 +1966,10 @@ el.settingsSave.addEventListener('click', async () => {
   el.settingsSave.disabled = true
   try {
     const payload = {
+      tokens: el.setTokens.value
+        .split('\n')
+        .map((v) => v.trim())
+        .filter(Boolean),
       proxy: el.setProxy.value.trim(),
       proxyMode: el.setMode.value,
       concurrency: Number(el.setConcurrency.value) || 4,
@@ -1900,8 +1982,18 @@ el.settingsSave.addEventListener('click', async () => {
     const { config } = await api('/api/config', { method: 'POST', body: payload, timeout: 15000 })
     state.config = config
     setProxyStat()
-    toast('设置已保存', 'ok')
     closeSettings()
+
+    // 刚可能把自己正在用的口令从列表里删掉了。立刻问一次，别等下一个请求
+    // 撞 401 才把整页盖起来 —— 那时用户正在读的页面会突然消失。
+    const probe = await authProbe(state.token).catch(() => null)
+    if (probe && probe.required && !probe.valid) {
+      state.token = ''
+      store.remove('jm-token')
+      showAuthWall('口令已更新，请用新口令重新进入')
+      return
+    }
+    toast('设置已保存', 'ok')
   } catch (err) {
     toast(err.message, 'err')
   } finally {
@@ -2054,5 +2146,5 @@ el.heroStats?.addEventListener('click', async () => {
   if (document.body.dataset.offline !== '1') toast('已连接', 'ok')
 })
 
-// 已确认过 18+ 才立即初始化，否则等点「进入」后再加载，避免口令框被遮罩挡住
-if (gateAccepted) boot()
+// 先过口令墙，再决定直接启动还是停在 18+ 门禁
+startApp()

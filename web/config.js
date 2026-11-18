@@ -23,6 +23,7 @@ export const DEFAULTS = {
   maxPages: 0,           // 0 = 不限制
   pageSize: 24,          // 搜索每页条数
   pageCacheMB: 512,      // 阅读页磁盘缓存上限（MB），0 = 不限
+  tokens: [],            // 额外访问口令（不含命令行 --token），空 = 只在命令行启用鉴权
   encrypt: 'none',       // none | id | custom（前端默认选中项）
   password: '',          // encrypt=custom 时的默认密码
 }
@@ -66,6 +67,19 @@ export function normalize(input = {}, { partial = true } = {}) {
   if ('encrypt' in input || !partial) {
     const e = String(input.encrypt || '').toLowerCase()
     out.encrypt = ['none', 'id', 'custom'].includes(e) ? e : (base.encrypt || 'none')
+  }
+  if ('tokens' in input || !partial) {
+    // 面板里是多行文本；接口里允许数组。去重、去空、单个最长 64，最多 20 个。
+    const raw = input.tokens
+    const arr = Array.isArray(raw) ? raw : String(raw ?? '').split(/[\n,;]+/)
+    const list = []
+    for (const it of arr) {
+      const v = String(it ?? '').trim()
+      if (!v || v.length > 64) continue
+      if (!list.includes(v)) list.push(v)
+      if (list.length >= 20) break
+    }
+    out.tokens = list
   }
   if ('password' in input || !partial) {
     const p = typeof input.password === 'string' ? input.password.trim() : ''
@@ -134,10 +148,27 @@ export function resolveServerOptions(argv = process.argv.slice(2)) {
   }
   const rawHost = arg('host') || process.env.JM_HOST || '127.0.0.1'
 
+  // 口令支持多个：--token a,b,c、重复写 --token、或环境变量 JM_TOKEN / JM_TOKENS。
+  // 给家人朋友各发一个，谁泄露了单独删掉那一个就行。
+  const tokens = []
+  const pushTokens = (text) => {
+    for (const piece of String(text || '').split(/[\s,;]+/)) {
+      const v = piece.trim()
+      if (!v || v.length > 64 || tokens.includes(v)) continue
+      if (tokens.length < 20) tokens.push(v)
+    }
+  }
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--token' || argv[i] === '--tokens') pushTokens(argv[i + 1])
+  }
+  pushTokens(process.env.JM_TOKEN)
+  pushTokens(process.env.JM_TOKENS)
+
   return {
     port: Number(arg('port') || process.env.JM_PORT || process.env.PORT || 7788),
     host: hostAlias[String(rawHost).toLowerCase()] || rawHost,
-    token: arg('token') || process.env.JM_TOKEN || '',
+    token: tokens[0] || '', // 兼容旧字段：第一个口令
+    tokens,                 // 全部命令行口令
     // 只有明确声明反代时才信任 X-Forwarded-For：否则客户端可伪造 IP 绕过口令限流
     trustProxy: flag('trust-proxy') || process.env.JM_TRUST_PROXY === '1',
   }

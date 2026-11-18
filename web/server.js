@@ -155,23 +155,101 @@ function clientIp(req) {
   return (req.socket.remoteAddress || '').trim()
 }
 
-function tokenEquals(given) {
+// 口令可以有好几个：命令行 --token 的那些 + 网页设置里存的那些。
+// 哈希预先算好，并手工留一个「删掉某个口令立刻生效」的缓存键。
+let tokenHashCache = { key: '\u0000', hashes: [] }
+
+function tokenHashes() {
+  const list = []
+  for (const t of options.tokens || []) {
+    const v = String(t || '').trim()
+    if (v && !list.includes(v)) list.push(v)
+  }
+  for (const t of Array.isArray(config.tokens) ? config.tokens : []) {
+    const v = String(t || '').trim()
+    if (v && !list.includes(v)) list.push(v)
+  }
+  const key = list.join('\u0000')
+  if (tokenHashCache.key !== key) {
+    tokenHashCache = {
+      key,
+      hashes: list.map((t) => crypto.createHash('sha256').update(t).digest()),
+    }
+  }
+  return tokenHashCache.hashes
+}
+
+/** 给定口令是否命中任意一个（全部比完不提前退出，避免按位置泄漏是哪一个）。 */
+function tokenMatches(given) {
+  const hashes = tokenHashes()
+  if (!hashes.length) return true
+  if (!given) return false
   // 先哈希再定长比较，既避免长度泄漏也躲开 timingSafeEqual 的长度限制
-  const a = crypto.createHash('sha256').update(String(given)).digest()
-  const b = crypto.createHash('sha256').update(String(options.token)).digest()
-  return crypto.timingSafeEqual(a, b)
+  const h = crypto.createHash('sha256').update(String(given)).digest()
+  let ok = false
+  for (const it of hashes) if (crypto.timingSafeEqual(h, it)) ok = true
+  return ok
+}
+
+/** 记一次错误。同一个 IP 一秒内的并发失败只算一次。 */
+function noteAuthFail(ip) {
+  const rec = authFails.get(ip)
+  if (rec?.until && rec.until > Date.now()) return
+  const now = Date.now()
+  const next = rec && !rec.until ? rec : { count: 0, until: 0, last: 0 }
+  if (now - (next.last || 0) < AUTH_FAIL_WINDOW) {
+    authFails.set(ip, next)
+    return
+  }
+  next.last = now
+  next.count += 1
+  if (next.count >= AUTH_MAX_FAIL) {
+    next.count = 0
+    next.until = now + AUTH_LOCK_MS
+    console.warn(`[auth] ${ip} 口令连续错误 ${AUTH_MAX_FAIL} 次，已锁定 10 分钟`)
+  }
+  authFails.set(ip, next)
+}
+
+/**
+ * 请求里所有可能的口令：query 和 header 都收。
+ * 图片请求带不了 header，所以 query 优先；而 header 在 Node 里按 latin1 解码，
+ * 中文口令会变成乱码 —— 这里顺手把乱码按 UTF-8 还原一份再比，不然中文口令
+ * 只有 query 能用、header 永远对不上。
+ */
+function givenTokens(req, url) {
+  const list = []
+  const q = url.searchParams.get('token')
+  if (q) list.push(String(q))
+  const h = req.headers['x-token']
+  if (h) {
+    list.push(String(h))
+    try {
+      const fixed = Buffer.from(String(h), 'latin1').toString('utf8')
+      if (fixed && fixed !== h && !fixed.includes('\uFFFD')) list.push(fixed)
+    } catch {
+      /* 不是合法 UTF-8 就只用原值 */
+    }
+  }
+  return [...new Set(list)]
+}
+
+/** 任一口令命中即通过。 */
+function matchesAny(list) {
+  for (const v of list) if (tokenMatches(v)) return true
+  return false
 }
 
 function checkToken(req, url) {
-  if (!options.token) return true
+  if (!tokenHashes().length) return true
   const ip = clientIp(req)
-  // 图片请求带不了 header，所以 query 参数优先；两处都取不到才算没带口令
-  const given = String(req.headers['x-token'] || url.searchParams.get('token') || '')
+  // 两处都取不到才算没带口令
+  const given = givenTokens(req, url)
 
   // 先比对再判锁：口令正确就放行并清掉记录。
   // 否则一旦被误锁（比如浏览器缓存了旧口令、图片漏带 token 刷出十条 401），
   // 即使后来输对了口令也要干等十分钟 —— 知道口令的人本来就该放行。
-  if (given && tokenEquals(given)) {
+  if (given.length && matchesAny(given)) {
     authFails.delete(ip)
     return true
   }
@@ -183,23 +261,9 @@ function checkToken(req, url) {
   // 完全没带口令：返回 401，但不计入爆破次数。
   // 封面、页图这类 <img> 请求漏拼一次 token，就能在几百毫秒内刷出几十条 401；
   // 之前正是这样把本机和手机一起锁了 10 分钟。
-  if (!given) return false
+  if (!given.length) return false
 
-  const now = Date.now()
-  const next = rec && !rec.until ? rec : { count: 0, until: 0, last: 0 }
-  if (now - (next.last || 0) < AUTH_FAIL_WINDOW) {
-    authFails.set(ip, next)
-    return false
-  }
-
-  next.last = now
-  next.count += 1
-  if (next.count >= AUTH_MAX_FAIL) {
-    next.count = 0
-    next.until = now + AUTH_LOCK_MS
-    console.warn(`[auth] ${ip} 口令连续错误 ${AUTH_MAX_FAIL} 次，已锁定 10 分钟`)
-  }
-  authFails.set(ip, next)
+  noteAuthFail(ip)
   return false
 }
 
@@ -1050,7 +1114,30 @@ async function handleFavoriteRemove(url, res, raw) {
 // 路由
 // ---------------------------------------------------------------------------
 
+/**
+ * 前端启动时先问这里：这台服务器要不要口令、我手里这个对不对。
+ * 它本身不能要口令，否则没有口令的人连「该不该显示输入框」都不知道，
+ * 只能先看见整个界面再被 401 弹窗盖住 —— 那就等于先把 UI 漏出去了。
+ *
+ * 带错口令照常计入爆破次数，别把它变成免鉴权的试密码通道。
+ */
+function handleAuthProbe(req, res, url) {
+  if (!tokenHashes().length) return sendJson(res, 200, { ok: true, required: false, valid: true })
+
+  const ip = clientIp(req)
+  const given = givenTokens(req, url)
+  if (given.length && matchesAny(given)) {
+    authFails.delete(ip)
+    return sendJson(res, 200, { ok: true, required: true, valid: true })
+  }
+
+  if (given.length && !authLockLeft(req)) noteAuthFail(ip)
+  sendJson(res, 200, { ok: true, required: true, valid: false, lockLeft: authLockLeft(req) })
+}
+
 async function handleApi(req, res, url) {
+  if ((req.method || 'GET') === 'GET' && url.pathname === '/api/auth') return handleAuthProbe(req, res, url)
+
   if (!checkToken(req, url)) {
     const left = authLockLeft(req)
     if (left > 0) {
@@ -1237,7 +1324,11 @@ async function main() {
     res.on('finish', () => {
       if (String(res.getHeader('Content-Type') || '').includes('event-stream')) return
       const ms = Date.now() - started
-      if (ms > 1200) console.log(`[slow] ${req.method} ${url.pathname}${url.search} ${ms}ms`)
+      if (ms > 1200) {
+        // 口令走 query 是常态（图片请求带不了 header），别把口令写进日志
+        const safeSearch = url.search.replace(/([?&]token=)[^&]*/gi, '$1***')
+        console.log(`[slow] ${req.method} ${url.pathname}${safeSearch} ${ms}ms`)
+      }
     })
     try {
       if (url.pathname.startsWith('/api/')) {
@@ -1281,7 +1372,9 @@ async function main() {
     const host = options.host === '0.0.0.0' ? 'localhost' : options.host
     console.log('')
     console.log('  JM Reader Web 已启动')
-    console.log(`  ➜  http://${host}:${options.port}${options.token ? `?token=${options.token}` : ''}`)
+    const firstToken = options.tokens?.[0] || config.tokens?.[0] || ''
+    console.log(`  ➜  http://${host}:${options.port}${firstToken ? `?token=${encodeURIComponent(firstToken)}` : ''}`)
+    if (tokenHashes().length > 1) console.log(`  ➜  已启用 ${tokenHashes().length} 个访问口令（任意一个都能进）`)
 
     if (options.host === '0.0.0.0' || options.host === '::') {
       console.log(`  ➜  监听 ${options.host}:${options.port}（局域网 / 组网可访问）`)
@@ -1292,15 +1385,16 @@ async function main() {
       } else {
         console.log('  ➜  没有检测到非回环网卡，检查一下网络连接')
       }
-      if (!options.token) {
+      if (!tokenHashes().length) {
         console.warn('  ⚠️  已对本机以外的设备开放，但没有设置访问口令 —— 拿到地址的人都能用')
-        console.warn('     建议改为：--host 0.0.0.0 --token 你的口令')
+        console.warn('     建议改为：--host 0.0.0.0 --token 你的口令（多个用逗号分隔）')
       }
     } else {
       console.log(`  ➜  监听 ${options.host}:${options.port}`)
       console.warn('  ⚠️  当前只允许本机访问：手机 / 平板 / 其它电脑连不上。')
       console.warn('     要组网或局域网访问，用：npm run web:lan')
       console.warn('     或：node web/server.js --host 0.0.0.0 --token 你的口令')
+      console.warn('     多个口令：--token 甲,乙,丙（也可以在网页设置里加，见「访问口令」）')
     }
 
     if (options.trustProxy) console.log('  ➜  信任反向代理的 X-Forwarded-For')

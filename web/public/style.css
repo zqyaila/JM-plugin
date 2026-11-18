@@ -960,6 +960,62 @@ body[data-offline='1'] .stat {
 
 /* ---------- 18+ 门槛 ---------- */
 
+/* ---------- 访问口令墙 ----------
+   锁定期间页面里只有这个输入框：其它直接子元素全部不渲染，
+   否则一刷新就能看见搜索框、封面墙，甚至 18+ 门禁。 */
+html.auth-locked body > *:not(#authwall) { display: none !important; }
+
+.authwall {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: radial-gradient(560px 420px at 50% 0%, rgba(255, 77, 109, 0.1), transparent 70%), var(--bg);
+}
+.authwall[hidden] { display: none !important; }
+.authwall-box {
+  width: min(300px, 100%);
+  display: grid;
+  gap: 13px;
+  justify-items: center;
+}
+.authwall-mark {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+}
+.authwall-input {
+  width: 100%;
+  padding: 12px 14px;
+  font-size: 15px;
+  text-align: center;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  transition: border-color 0.16s var(--ease), box-shadow 0.16s var(--ease);
+}
+.authwall-input::placeholder { color: var(--text-mute); }
+.authwall-input:focus {
+  outline: none;
+  border-color: rgba(255, 77, 109, 0.6);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.authwall-input:disabled { opacity: 0.6; }
+.authwall-msg {
+  margin: 0;
+  min-height: 17px;
+  font-size: 12.5px;
+  line-height: 1.4;
+  text-align: center;
+  color: var(--text-mute);
+}
+.authwall-msg.bad { color: var(--err); }
+
 .gate {
   position: fixed;
   inset: 0;

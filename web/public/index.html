@@ -6,14 +6,27 @@
 <meta name="color-scheme" content="dark" />
 <title>JM Reader · 在线阅读与 PDF 下载</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff4d6d'/%3E%3Cpath d='M9 8h9a4 4 0 0 1 4 4v12H13a4 4 0 0 0-4 4V8z' fill='%23fff'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/style.css?v=22" />
+<link rel="stylesheet" href="/style.css?v=25" />
 <script>
+  // 先锁住整个界面：服务端要不要口令只能问接口，问清楚再放开。
+  // 这样在输对口令之前，页面里除了输入框什么都不渲染（18+ 门禁也不露）。
+  document.documentElement.classList.add('auth-locked')
   try {
     if (localStorage.getItem('jm-gate-accepted') === '1') document.documentElement.classList.add('gate-passed')
   } catch (e) {}
 </script>
 </head>
 <body>
+
+<!-- 访问口令墙：通过之前，页面里除这个输入框什么都不渲染（见 style.css 的 html.auth-locked） -->
+<div class="authwall" id="authwall">
+  <div class="authwall-box">
+    <span class="authwall-mark">JM Reader</span>
+    <input class="authwall-input" id="authwall-input" type="password" autocomplete="current-password"
+           placeholder="访问口令" aria-label="访问口令" />
+    <p class="authwall-msg" id="authwall-msg" role="status"></p>
+  </div>
+</div>
 
 <!-- 成人内容提示：首次进入需确认 -->
 <div class="gate" id="gate">
@@ -169,6 +182,13 @@
   </header>
   <div class="modal-body">
     <div class="field">
+      <label for="set-tokens">访问口令（每行一个）</label>
+      <textarea id="set-tokens" rows="2" spellcheck="false" autocomplete="off"
+                placeholder="留空表示不启用口令；建议 8 位以上，别用 123456"></textarea>
+      <p class="field-hint">可填多个，任意一个都能进；谁泄露了删掉那一行即可。命令行 <code>--token</code> 的始终有效，不在此列表。</p>
+    </div>
+
+    <div class="field">
       <label for="set-proxy">代理地址</label>
       <textarea id="set-proxy" rows="2" placeholder="http://127.0.0.1:7890&#10;socks5://user:pass@127.0.0.1:1080"></textarea>
       <p class="field-hint">支持 <code>http://</code> <code>https://</code> <code>socks5://</code>，可填多个，失败自动轮换。</p>
@@ -235,25 +255,6 @@
   </footer>
 </div>
 
-<!-- 访问口令：服务端以 --token 启动时才会出现 -->
-<div class="modal-scrim" id="auth-scrim" hidden></div>
-<div class="modal" id="auth" aria-hidden="true" role="dialog" aria-label="需要访问口令">
-  <header class="modal-head">
-    <h3>需要访问口令</h3>
-  </header>
-  <div class="modal-body">
-    <div class="field">
-      <label for="auth-input">访问口令</label>
-      <input id="auth-input" type="password" autocomplete="current-password" placeholder="启动服务时设置的口令" />
-      <p class="field-hint">口令只保存在本机浏览器，每次请求随头部发送。</p>
-    </div>
-    <div class="test-result" id="auth-error"></div>
-  </div>
-  <footer class="modal-foot">
-    <button class="btn primary" id="auth-submit">进入</button>
-  </footer>
-</div>
-
 <!-- 在线阅读器 -->
 <div class="reader" id="reader" aria-hidden="true">
   <header class="reader-bar">
@@ -299,6 +300,6 @@
 
 <div class="toasts" id="toasts"></div>
 
-<script type="module" src="/app.js?v=22"></script>
+<script type="module" src="/app.js?v=25"></script>
 </body>
 </html>
