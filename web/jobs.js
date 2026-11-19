@@ -21,7 +21,12 @@ import { createZipWriter } from '../apps/zip.js'
 
 const MAX_CONCURRENT = 2
 const MAX_JOBS_KEPT = 80
-const MERGE_PAGE_LIMIT = 350 // 单个文档的页数上限，和 server.js 的保持一致
+
+/** 单个合并 PDF 的页数上限：跟着设置走，改了立即生效。 */
+function mergeLimit(cfg) {
+  const n = parseInt(cfg?.mergePageLimit, 10)
+  return Number.isFinite(n) && n > 0 ? n : 350
+}
 const PROGRESS_THROTTLE = 200 // ms
 const EXPORT_DIR = path.join(DATA_DIR, 'exports')
 const EXPORT_KEEP = 20
@@ -189,7 +194,7 @@ export function createJobManager({ client, repo, getConfig, getPage }) {
           userPassword,
           ownerPassword: job.ownerPassword || '',
           quality: Number(cfg.quality) || 82,
-          maxPagesPerFile: MERGE_PAGE_LIMIT,
+          maxPagesPerFile: mergeLimit(cfg),
         }, {
           onProgress: (done, total) => update(job, { done, total, message: `正在从本地缓存排版 ${done}/${total} 页` }),
         })
@@ -208,6 +213,7 @@ export function createJobManager({ client, repo, getConfig, getPage }) {
             retries: 3,
             retryDelay: 2000,
             quality: Number(cfg.quality) || 82,
+            maxPagesPerFile: mergeLimit(cfg),
             loadCached,
           },
         )
@@ -303,7 +309,7 @@ export function createJobManager({ client, repo, getConfig, getPage }) {
                 userPassword,
                 ownerPassword: job.ownerPassword || '',
                 quality: Number(cfg.quality) || 82,
-                maxPagesPerFile: MERGE_PAGE_LIMIT,
+                maxPagesPerFile: mergeLimit(cfg),
               },
               {
                 onProgress: (n, t) => {
@@ -347,7 +353,7 @@ export function createJobManager({ client, repo, getConfig, getPage }) {
                   ownerPassword: job.ownerPassword || '',
                   concurrency: Number(cfg.concurrency) || 4,
                   quality: Number(cfg.quality) || 82,
-                  maxPagesPerFile: 350,
+                  maxPagesPerFile: mergeLimit(cfg),
                   loadCached,
                 },
                 {

@@ -130,10 +130,20 @@ async function mutateIndex(fn) {
   return task
 }
 
-/** 生成缓存文件名。整本=id，单章=id_c<章节>，区间/打包=id_<标签>。 */
+/**
+ * 生成缓存文件名。整本=id，单章=id_c<章节>，区间=id_r<a>-<b>，打包=id_<标签>。
+ *
+ * 区间既可能是 web 端拼好的字符串（`r1-5`），也可能是插件直接传的
+ * `{from, to}` 对象 —— 两种都要落到同一个键上，否则同一段区间会被下载两遍。
+ */
 export function cacheKey(id, chapterIdx = null) {
   if (chapterIdx == null) return `${id}`
   if (typeof chapterIdx === 'number') return `${id}_c${chapterIdx}`
+  if (typeof chapterIdx === 'object') {
+    const from = Number(chapterIdx.from) || 1
+    const to = chapterIdx.to == null ? 'end' : Number(chapterIdx.to)
+    return `${id}_r${from}-${to}`
+  }
   return `${id}_${String(chapterIdx).replace(/[^\w-]/g, '')}`
 }
 

@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark" />
 <title>JM Reader · 在线阅读与 PDF 下载</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff4d6d'/%3E%3Cpath d='M9 8h9a4 4 0 0 1 4 4v12H13a4 4 0 0 0-4 4V8z' fill='%23fff'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/style.css?v=29" />
+<link rel="stylesheet" href="/style.css?v=30" />
 <script>
   // 先锁住整个界面：服务端要不要口令只能问接口，问清楚再放开。
   // 这样在输对口令之前，页面里除了输入框什么都不渲染（18+ 门禁也不露）。
@@ -221,6 +221,12 @@
       </div>
     </div>
 
+    <div class="field">
+      <label for="set-merge-limit">合并 PDF 页数上限</label>
+      <input id="set-merge-limit" type="number" min="1" max="5000" />
+      <p class="field-hint">多个章节合成一个 PDF 时超过就不让合；内存够可以自己往上试，默认 350</p>
+    </div>
+
     <div class="field-row">
       <div class="field">
         <label for="set-pagecache">阅读缓存上限（MB）</label>
@@ -301,6 +307,6 @@
 
 <div class="toasts" id="toasts"></div>
 
-<script type="module" src="/app.js?v=29"></script>
+<script type="module" src="/app.js?v=30"></script>
 </body>
 </html>

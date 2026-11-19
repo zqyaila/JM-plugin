@@ -31,8 +31,13 @@ import { createFavorites } from './favorites.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC_DIR = path.join(__dirname, 'public')
 const SERVER_PAGE_SIZE = 80 // 服务端搜索接口固定每页 80 条
-const MERGE_PAGE_LIMIT = 350 // 单个合并 PDF 的页数上限，超过就必须分章
 const MERGE_CHAPTER_HINT = 4 // 页数未知时，超过这么多章就不建议合并
+
+/** 单个合并 PDF 的页数上限。可在设置里改，用来试出这台机器能合多少页。 */
+function mergeLimit() {
+  const n = parseInt(config.mergePageLimit, 10)
+  return Number.isFinite(n) && n > 0 ? n : 350
+}
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -901,11 +906,12 @@ async function createOfflineJob({ res, id, mode, from, to, encrypt, password }) 
   }
 
   const pages = chapters.reduce((n, c) => n + c.pages, 0)
-  if (mode === 'single' && pages > MERGE_PAGE_LIMIT) {
+  if (mode === 'single' && pages > mergeLimit()) {
     return sendError(
       res,
       400,
-      `所选范围 ${pages} 页，单个 PDF 上限 ${MERGE_PAGE_LIMIT} 页。请改用「每章一个 PDF 打包」，同样只读本地缓存。`,
+      `所选范围 ${pages} 页，单个 PDF 上限 ${mergeLimit()} 页。请改用「每章一个 PDF 打包」，同样只读本地缓存；` +
+        '或在设置里调高「合并 PDF 页数上限」。',
     )
   }
 
@@ -985,11 +991,12 @@ async function handleCreateJob(req, res) {
     )
   }
 
-  if (mode === 'single' && estimated > MERGE_PAGE_LIMIT) {
+  if (mode === 'single' && estimated > mergeLimit()) {
     return sendError(
       res,
       400,
-      `所选范围约 ${estimated} 页，单个 PDF 上限 ${MERGE_PAGE_LIMIT} 页（再多会撑爆内存）。请改用「每章一个 PDF 打包」，或缩小章节范围。`,
+      `所选范围约 ${estimated} 页，单个 PDF 上限 ${mergeLimit()} 页（再多会撑爆内存）。` +
+        '请改用「每章一个 PDF 打包」、缩小章节范围，或在设置里调高「合并 PDF 页数上限」。',
     )
   }
 
@@ -999,7 +1006,7 @@ async function handleCreateJob(req, res) {
     return sendError(
       res,
       400,
-      `该作品共 ${chapters.length} 章、页数未知，合并成一个 PDF 很可能超过 ${MERGE_PAGE_LIMIT} 页。` +
+      `该作品共 ${chapters.length} 章、页数未知，合并成一个 PDF 很可能超过 ${mergeLimit()} 页。` +
         '请改用「每章一个 PDF 打包」（可一次选中多章），或把范围缩到几章再试。',
     )
   }

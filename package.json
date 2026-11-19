@@ -1,6 +1,6 @@
 {
   "name": "jmreader-plugin",
-  "version": "1.6.3",
+  "version": "1.6.4",
   "description": "JM Reader 漫画阅读器 —— TRSS-Yunzai 插件 + Web PDF 下载器（搜索/详情/阅读/代理/导 PDF）",
   "type": "module",
   "main": "index.js",
@@ -10,7 +10,7 @@
     "sharp": "^0.35.5"
   },
   "scripts": {
-    "check": "node --check index.js && node --check apps/jmcore.js && node --check apps/jm.js && node --check apps/proxy.js && node --check web/server.js && node --check web/jobs.js && node --check web/pagecache.js && node --check web/offline.js && node --check web/favorites.js && node --check web/public/app.js",
+    "check": "node --check index.js && node --check apps/jmcore.js && node --check apps/jm.js && node --check apps/chapter-range.js && node --check apps/proxy.js && node --check web/server.js && node --check web/jobs.js && node --check web/pagecache.js && node --check web/offline.js && node --check web/favorites.js && node --check web/public/app.js",
     "web": "node web/server.js",
     "web:lan": "node web/server.js --host 0.0.0.0"
   }

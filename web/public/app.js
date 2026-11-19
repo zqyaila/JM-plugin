@@ -102,6 +102,7 @@ const el = {
   setConcurrency: $('#set-concurrency'),
   setQuality: $('#set-quality'),
   setMaxPages: $('#set-maxpages'),
+  setMergeLimit: $('#set-merge-limit'),
   setPageCache: $('#set-pagecache'),
   btnClearPages: $('#btn-clear-pages'),
   pagesStat: $('#pages-stat'),
@@ -877,7 +878,7 @@ function renderDetail(album) {
         </label>
         <label class="radio ${state.split === 'single' ? 'checked' : ''}">
           <input type="radio" name="split" value="single" ${state.split === 'single' ? 'checked' : ''} />
-          <span>合并成一个 PDF <small>单文件上限 350 页</small></span>
+          <span>合并成一个 PDF <small>单文件上限 ${mergeLimit()} 页</small></span>
         </label>
       </div>
     </div>
@@ -1006,7 +1007,11 @@ function selectedChapters() {
   return album.series.filter((s) => s.sort >= state.from && s.sort <= state.to)
 }
 
-const MERGE_LIMIT = 350
+/** 单个合并 PDF 的页数上限（跟着设置走）。 */
+function mergeLimit() {
+  const n = Number(state.config?.mergePageLimit)
+  return Number.isFinite(n) && n > 0 ? n : 350
+}
 
 function updateSummary() {
   const album = state.album
@@ -1028,7 +1033,7 @@ function updateSummary() {
   // 页数为 0 表示章节元信息没给 total_page，多章合并必然超限，同样按「不能合并」处理。
   const singleRadio = $(`input[name="split"][value="single"]`, el.drawerBody)
   const unknownHeavy = pages === 0 && list.length > 4
-  const tooMany = pages > MERGE_LIMIT || unknownHeavy
+  const tooMany = pages > mergeLimit() || unknownHeavy
   if (singleRadio) {
     singleRadio.disabled = tooMany
     if (tooMany && state.split === 'single') {
@@ -1046,7 +1051,7 @@ function updateSummary() {
       : tooMany
         ? unknownHeavy
           ? `${list.length} 章页数未知，请改用分章`
-          : `超过 ${MERGE_LIMIT} 页，请改用分章`
+          : `超过 ${mergeLimit()} 页，请改用分章`
         : '1 个 PDF'
 
   const hint = $('#range-hint', el.drawerBody)
@@ -1117,7 +1122,7 @@ function renderOfflineSection(album, cov) {
   const pct = total ? Math.min(100, Math.round((progress / total) * 100)) : 0
   if (hint) hint.textContent = cov.complete ? '整本已缓存' : `已看 ${pct}%`
 
-  const tooBig = state.split === 'single' && cov.pages > MERGE_LIMIT
+  const tooBig = state.split === 'single' && cov.pages > mergeLimit()
 
   slot.innerHTML = `
     <div class="offline-meter" title="整本缓存进度"><i style="width:${pct}%"></i></div>
@@ -1131,7 +1136,7 @@ function renderOfflineSection(album, cov) {
         ? '<p class="offline-note ok">整本已经在硬盘上了，导出只做排版：不联网、不再消耗流量。</p>'
         : '<p class="offline-note">没看完的章节导出时会照常联网补下，<b>看过的页不会重复下载</b>。</p>'
     }
-    ${tooBig ? `<p class="offline-note warn">整本 ${fmtNum(cov.pages)} 页，超过单文件 350 页上限，请先选「每章一个 PDF 打包」。</p>` : ''}
+    ${tooBig ? `<p class="offline-note warn">整本 ${fmtNum(cov.pages)} 页，超过单文件 ${mergeLimit()} 页上限，请先选「每章一个 PDF 打包」。</p>` : ''}
     <div class="offline-actions">
       ${
         cov.complete
@@ -1422,7 +1427,7 @@ async function exportOfflineItem(id) {
   if (!it) return
   const encrypt = state.config?.encrypt || 'none'
   const password = state.config?.password || ''
-  const mode = it.pages > MERGE_LIMIT ? 'zip' : 'single'
+  const mode = it.pages > mergeLimit() ? 'zip' : 'single'
   try {
     const { job } = await api('/api/jobs', {
       method: 'POST',
@@ -1883,7 +1888,7 @@ async function exportOfflineFromReader() {
   const r = state.reader
   const cov = r.offline
   if (!cov?.complete) return
-  const mode = cov.pages > MERGE_LIMIT ? 'zip' : 'single'
+  const mode = cov.pages > mergeLimit() ? 'zip' : 'single'
   try {
     const { job } = await api('/api/jobs', {
       method: 'POST',
@@ -2187,6 +2192,7 @@ function fillSettings(cfg) {
   el.setConcurrency.value = cfg.concurrency ?? 4
   el.setQuality.value = cfg.quality ?? 82
   el.setMaxPages.value = cfg.maxPages ?? 0
+  el.setMergeLimit.value = cfg.mergePageLimit ?? 350
   el.setPageCache.value = cfg.pageCacheMB ?? 512
   el.setTokens.value = (cfg.tokens || []).join('\n')
   el.setEncrypt.value = cfg.encrypt || 'none'
@@ -2262,6 +2268,7 @@ el.settingsSave.addEventListener('click', async () => {
       concurrency: Number(el.setConcurrency.value) || 4,
       quality: Number(el.setQuality.value) || 82,
       maxPages: Number(el.setMaxPages.value) || 0,
+      mergePageLimit: Number(el.setMergeLimit.value) || 350,
       pageCacheMB: Math.max(0, Number(el.setPageCache.value) || 0),
       encrypt: el.setEncrypt.value,
       password: el.setPassword.value,

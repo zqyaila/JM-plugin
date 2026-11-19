@@ -824,8 +824,13 @@ export async function buildCachedPdf(chapters, opts = {}, hooks = {}) {
  * @param {null|number|{from:number,to:number}} range
  */
 export async function countComicPages(repo, albumId, range = null) {
-  const { chapters } = await resolveChapters(repo, albumId, range)
-  return chapters.reduce((sum, c) => sum + (Number(c.totalPage) || 0), 0)
+  const { detail, chapters } = await resolveChapters(repo, albumId, range)
+  const sum = chapters.reduce((acc, c) => acc + (Number(c.totalPage) || 0), 0)
+  if (sum > 0) return sum
+  // 系列接口通常不给每章页数（totalPage 全是 0），整本时用作品总页数兜底；
+  // 区间/单章没法推算，返回 0 表示"未知"，由 buildComicPdf 边收集边判断。
+  if (range == null && Number(detail.totalPhotos) > 0) return Number(detail.totalPhotos)
+  return 0
 }
 
 export default JmRepository

@@ -29,11 +29,13 @@
 import plugin from '../../lib/plugins/plugin.js'
 import makeConfig from '../../lib/plugins/config.js'
 import path from 'node:path'
+import fsp from 'node:fs/promises'
 import JmClient from './apps/jmcore.js'
-import JmRepository, { buildComicPdf, countComicPages } from './apps/jm.js'
+import JmRepository, { buildComicPdf, buildChapterPdf, resolveChapters, countComicPages } from './apps/jm.js'
 import { renderDetailCard, renderChaptersCard, renderListCard } from './apps/render.js'
 import { getCachedPdf, putCachedPdf, removeCachedPdf, listCache, pdfPasswordMatches, DATA_DIR } from './apps/store.js'
 import { createPageStore } from './web/pagecache.js'
+import { parseChapterArg, chapterSuffix } from './apps/chapter-range.js'
 import { parseProxyList, maskProxy, testProxy } from './apps/proxy.js'
 
 const client = new JmClient()
@@ -56,12 +58,25 @@ function getPageStore() {
   return pageStore
 }
 
+const TMP_DIR = path.join(DATA_DIR, 'tmp')
+const MAX_SPLIT = 15 // 一次最多发这么多个 PDF，再多容易被风控
+
+const USAGE = `用法：
+  #jm<JM号>              整本合成一个 PDF
+  #jm<JM号> 5            只下第 5 章
+  #jm<JM号> 1-5          第 1-5 章合并成一个 PDF
+  #jm<JM号> 1-x          第 1 章到最后一章
+  #jm<JM号> 1-5 --split  每章一个 PDF，逐个发送`
+
+const SPLIT_FLAG = /^(--?split|-s|分章|拆分)$/i
+
 const { config, configSave } = await makeConfig('jmreader', {
   pdfPassword: '',
   pageSize: 10,
   imageQuality: 82,
   maxPages: 0,
   downloadConcurrency: 4,
+  mergePageLimit: 350,
   usePageCache: true,
   proxy: '',
   proxyMode: 'all',
@@ -88,6 +103,10 @@ globalThis.__jmreaderSetConfig = (data) => {
     const c = parseInt(data.downloadConcurrency, 10)
     config.downloadConcurrency = Number.isFinite(c) && c > 0 ? Math.min(c, 10) : 4
   }
+  if ('mergePageLimit' in data) {
+    const n = parseInt(data.mergePageLimit, 10)
+    config.mergePageLimit = Number.isFinite(n) && n > 0 ? Math.min(n, 5000) : 350
+  }
   if ('usePageCache' in data) {
     config.usePageCache = data.usePageCache !== false && data.usePageCache !== 'false'
   }
@@ -109,7 +128,7 @@ export class JMReader extends plugin {
       event: 'message',
       priority: 5000,
       rule: [
-        { reg: new RegExp('^#?jm(\\d{5,})\\s*$', 'i'), fnc: 'pdf' },
+        { reg: new RegExp('^#?jm(\\d{5,})\\s*(.*)$', 'i'), fnc: 'pdf' },
         { reg: new RegExp('^#?jm(搜索|搜|search)\\s*(.*)$', 'i'), fnc: 'search' },
         { reg: new RegExp('^#?jm(详情|detail|info)\\s*(.*)$', 'i'), fnc: 'detail' },
         { reg: new RegExp('^#?jm(章节|章|list)\\s*(.*)$', 'i'), fnc: 'chapters' },
@@ -192,6 +211,12 @@ export class JMReader extends plugin {
   get downloadConcurrency() {
     const n = parseInt(config.downloadConcurrency, 10)
     return Number.isFinite(n) && n > 0 ? Math.min(n, 10) : 4
+  }
+
+  /** 合并单个 PDF 的页数上限（配置，默认 350）。 */
+  get mergePageLimit() {
+    const n = parseInt(config.mergePageLimit, 10)
+    return Number.isFinite(n) && n > 0 ? Math.min(n, 5000) : 350
   }
 
   /** 复用网页端阅读缓存（默认开）。 */
@@ -594,7 +619,8 @@ export class JMReader extends plugin {
   /** 发送 PDF 文件，带兜底与友好错误提示。 */
   async _sendPdfFile(e, filePath, fileName, headMsg) {
     try {
-      await e.reply([headMsg, segment.file(filePath, fileName)])
+      // 分章连发时只有第一条带说明，后面纯文件
+      await e.reply(headMsg ? [headMsg, segment.file(filePath, fileName)] : segment.file(filePath, fileName))
       return
     } catch (err) {
       // 上传失败（如 QQ 群文件 210005）兜底：读字节转 base64 直发一次
@@ -614,15 +640,25 @@ export class JMReader extends plugin {
   }
 
   async pdf(e) {
-    // 兼容两种触发形式：#jm1480269（纯数字）或 #jmpdf 1480269 [章节]
+    // 兼容三种触发形式：#jm1480269 / #jmpdf 1480269 5 / #jm1480269 1-5 [--split]
     const text = (e.msg.match(/^#?jm(?:pdf|下载|download|导出)?\s*(.*)$/i) || [])[1]?.trim()
     const parts = text.split(/\s+/).filter(Boolean)
     const id = this.parseId(parts[0])
     if (!id) {
-      await e.reply('用法：#jm<数字> 或 #jmpdf <JM号> [章节序号]\n不填章节=整本，填了=单章')
+      await e.reply(USAGE)
       return true
     }
-    const chapterIdx = parts[1] ? parseInt(parts[1], 10) : null
+
+    const rest = parts.slice(1)
+    const split = rest.some((t) => SPLIT_FLAG.test(t))
+    const argRaw = rest.find((t) => !SPLIT_FLAG.test(t)) || ''
+    const picked = parseChapterArg(argRaw)
+    if (!picked.ok) {
+      await e.reply(`❌ 章节参数看不懂：${argRaw}\n\n${USAGE}`)
+      return true
+    }
+    const chapterIdx = picked.range
+    const label = picked.label
 
     // 双密码：通用密码（userPassword）+ 作品 id（ownerPassword）
     const commonPwd = (config.pdfPassword || '').trim()
@@ -636,10 +672,19 @@ export class JMReader extends plugin {
       await this.ensureBootstrap()
       totalPage = await countComicPages(repo, id, chapterIdx)
       if (maxPages > 0 && totalPage > maxPages) {
-        await e.reply(`❌ 该漫画共 ${totalPage} 页，超过最大页数限制（${maxPages} 页）\n请改用单章下载：#jmpdf ${id} <章节序号>，或联系主人调高限制`)
+        await e.reply(
+          `❌ ${label}共 ${totalPage} 页，超过最大页数限制（${maxPages} 页）\n` +
+            `可以缩小范围，例如 #jm${id} 1-3；或联系主人调高上限`,
+        )
         return true
       }
     } catch {}
+
+    // 分章模式：每章单独生成、单独发送，不查整体缓存
+    if (split) {
+      await this._sendSplitPdfs(e, { id, chapterIdx, userPassword, ownerPassword, label })
+      return true
+    }
 
     // 先查缓存：只有「同一套密码策略」才能直接发。
     // 网页端可能用别的密码（或干脆不加密）生成过一份，直接发出去用户拿到的口令打不开。
@@ -647,8 +692,21 @@ export class JMReader extends plugin {
     if (cached && pdfPasswordMatches(cached.meta, userPassword, ownerPassword)) {
       // 命中缓存，直接发
       const headMsg = `📕《${cached.meta.name || `JM${id}`}》JM${id}（缓存）已生成加密 PDF（${cached.meta.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
-      const fileName = `${id}${chapterIdx != null ? `_c${chapterIdx}` : ''}.pdf`
+      const fileName = `${id}${chapterSuffix(chapterIdx)}.pdf`
       await this._sendPdfFile(e, cached.file, fileName, headMsg)
+      return true
+    }
+
+    // 没有缓存才需要现场合并，这时才看上限 —— 已经生成好的文件不该被新上限拦下。
+    // 页数越多 WASM 内存峰值越高，这个值可以在锅巴/网页里改，方便自己试机器能扛多少页。
+    const mergeLimit = this.mergePageLimit
+    if (totalPage > mergeLimit) {
+      await e.reply(
+        `❌ ${label}共 ${totalPage} 页，超过单个 PDF 的合并上限（${mergeLimit} 页）。\n` +
+          `· 分章发送：#jm${id} ${argRaw || '1-x'} --split\n` +
+          `· 缩小范围后重试\n` +
+          `· 主人可在锅巴面板调高「合并 PDF 页数上限」（当前 ${mergeLimit}）`,
+      )
       return true
     }
 
@@ -694,6 +752,7 @@ export class JMReader extends plugin {
           retries: 3,
           retryDelay: 2000,
           quality: parseInt(config.imageQuality, 10) || 82,
+          maxPagesPerFile: mergeLimit,
           loadCached,
         },
       )
@@ -705,7 +764,7 @@ export class JMReader extends plugin {
         ownerPassword,
       })
       const rec = await getCachedPdf(id, chapterIdx)
-      const fileName = `${id}${chapterIdx != null ? `_c${chapterIdx}` : ''}.pdf`
+      const fileName = `${id}${chapterSuffix(chapterIdx)}.pdf`
 
       const hitNote =
         result.cacheHits > 0
@@ -714,9 +773,112 @@ export class JMReader extends plugin {
       const headMsg = `📕《${result.name}》JM${id} 已生成加密 PDF（${result.pageCount} 页）${hitNote}\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
       await this._sendPdfFile(e, rec.file, fileName, headMsg)
     } catch (err) {
-      await e.reply(`❌ ${err.serverMessage || err.message || '生成 PDF 失败'}`)
+      const msg = err?.serverMessage || err?.message || '生成 PDF 失败'
+      // 页数超过上限是用户最常撞到的墙，直接把两条出路写出来
+      const tip = /超过单个 PDF 上限/.test(msg)
+        ? `\n\n💡 可以分章发送：#jm${id} ${argRaw || '1-x'} --split\n   或在锅巴面板调高「合并 PDF 页数上限」（当前 ${mergeLimit}）`
+        : ''
+      await e.reply(`❌ ${msg}${tip}`)
     }
     return true
+  }
+
+  /**
+   * 分章模式：按章节逐个生成 PDF 并发送。
+   *
+   * 为什么限制条数：群里连续发十几个文件很容易被风控，而且用户自己也不好找。
+   * 超过上限就让他分批，而不是一口气刷屏。
+   */
+  async _sendSplitPdfs(e, { id, chapterIdx, userPassword, ownerPassword, label }) {
+    const { chapters } = await resolveChapters(repo, id, chapterIdx)
+    if (chapters.length > MAX_SPLIT) {
+      await e.reply(
+        `❌ ${label}共 ${chapters.length} 章，一次最多分章发 ${MAX_SPLIT} 个，请分批：\n` +
+          `   #jm${id} 1-${MAX_SPLIT} --split`,
+      )
+      return
+    }
+
+    const loadCached =
+      this.usePageCache
+        ? async (cid, p) => {
+            try {
+              const hit = await getPageStore().get(cid, p)
+              return hit?.buf || null
+            } catch {
+              return null
+            }
+          }
+        : null
+    if (loadCached) getPageStore().refresh()
+
+    await e.reply(
+      `⏳ ${label}共 ${chapters.length} 章，正在逐章生成并发送…` +
+        (loadCached ? '\n⚡ 网页里看过的页会直接从本地读取' : ''),
+    )
+
+    const pwdLine = `🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」`
+    let sent = 0
+    const failed = []
+
+    for (let i = 0; i < chapters.length; i++) {
+      const ch = chapters[i]
+      try {
+        const parts = await buildChapterPdf(
+          client,
+          repo,
+          id,
+          ch,
+          {
+            userPassword,
+            ownerPassword,
+            concurrency: this.downloadConcurrency,
+            quality: parseInt(config.imageQuality, 10) || 82,
+            maxPagesPerFile: this.mergePageLimit,
+            loadCached,
+          },
+        )
+
+        for (const p of parts) {
+          const fileName = `${id}_c${ch.sort}${p.parts > 1 ? `_p${p.part}` : ''}.pdf`
+          await fsp.mkdir(TMP_DIR, { recursive: true })
+          const tmp = path.join(TMP_DIR, `${Date.now().toString(36)}_${fileName}`)
+          await fsp.writeFile(tmp, p.buf)
+          try {
+            const head =
+              sent === 0
+                ? `📕《${p.name}》JM${id} · 第 ${ch.sort} 章（${p.pageCount} 页${p.parts > 1 ? `，第 ${p.part}/${p.parts} 卷` : ''}）\n${pwdLine}`
+                : ''
+            await this._sendPdfFile(e, tmp, fileName, head)
+            sent++
+          } finally {
+            await fsp.rm(tmp, { force: true })
+          }
+
+          // 单卷的章才缓存：多卷共用同一个 key 会互相覆盖
+          if (p.parts === 1) {
+            await putCachedPdf(id, ch.sort, p.buf, {
+              name: p.name,
+              pageCount: p.pageCount,
+              userPassword,
+              ownerPassword,
+            })
+          }
+        }
+      } catch (err) {
+        failed.push(`第${ch.sort}章`)
+      }
+    }
+
+    if (failed.length) {
+      await e.reply(
+        `⚠️ 已发送 ${sent} 个 PDF，${failed.length} 章失败：${failed.join('、')}\n` +
+          '可以单独重试失败的章节，例如 #jm' +
+          id +
+          ' ' +
+          failed[0].replace(/[^0-9]/g, ''),
+      )
+    }
   }
 
   /** 主人删除单个缓存资源。 */
@@ -724,13 +886,21 @@ export class JMReader extends plugin {
     const text = (e.msg.match(/^#?jm(?:删除|删|del|delete)\s*(.*)$/i) || [])[1]?.trim()
     const id = this.parseId(text)
     if (!id) {
-      await e.reply('用法：#jm删除 <JM号> [章节序号]\n删除指定作品的缓存 PDF；#jm清缓存 清空全部')
+      await e.reply('用法：#jm删除 <JM号> [章节|区间]\n例：#jm删除 123456 5 / #jm删除 123456 1-5 / #jm删除 123456（整本）\n清空全部用 #jm清缓存')
       return true
     }
     const parts = text.split(/\s+/).filter(Boolean)
-    const chapterIdx = parts[1] ? parseInt(parts[1], 10) : null
-    const n = await removeCachedPdf(id, chapterIdx)
-    await e.reply(n > 0 ? `✅ 已删除 JM${id}${chapterIdx != null ? ` 第${chapterIdx}章` : ''} 的缓存 PDF` : `未找到 JM${id} 的缓存`)
+    const picked = parseChapterArg(parts[1] || '')
+    if (!picked.ok) {
+      await e.reply('❌ 章节参数看不懂，例：#jm删除 123456 1-5')
+      return true
+    }
+    const n = await removeCachedPdf(id, picked.range)
+    await e.reply(
+      n > 0
+        ? `✅ 已删除 JM${id}（${picked.label}）的缓存 PDF`
+        : `未找到 JM${id}（${picked.label}）的缓存`,
+    )
     return true
   }
 
@@ -763,8 +933,9 @@ export class JMReader extends plugin {
     try {
       await this.ensureBootstrap().catch(() => {})
       const items = [
-        { no: '', name: '#jm<数字>', sub: '下载该作为加密 PDF，如 #jm1480269' },
-        { no: '', name: '#jmpdf <JM号> [章节]', sub: '下载为加密 PDF（不填章节=整本）' },
+        { no: '', name: '#jm<数字>', sub: '整本合成一个加密 PDF，如 #jm1480269' },
+        { no: '', name: '#jm<数字> 5 / 1-5 / 1-x', sub: '单章 / 章节区间（合并成一个 PDF）' },
+        { no: '', name: '#jm<数字> 1-5 --split', sub: '章节区间，每章一个 PDF 逐个发' },
         { no: '', name: '#jm密码 <新密码>', sub: '设置/查看/清空通用密码' },
         { no: '', name: '#jm搜索 <关键词> [页码]', sub: '搜索作品（可翻页）' },
         { no: '', name: '#jm下一页 / #jm上一页', sub: '搜索结果翻页' },
@@ -772,7 +943,7 @@ export class JMReader extends plugin {
         { no: '', name: '#jm看 <JM号> [章节]', sub: '章节文字信息' },
         { no: '', name: '#jm热门 / #jm随机 / #jm分类', sub: '发现作品' },
         { no: '', name: '#jm登录 / #jm退出 / #jm收藏 / #jm历史', sub: '会员功能' },
-        { no: '', name: '#jm删除 <JM号> / #jm清缓存', sub: '主人：删除/清空缓存' },
+        { no: '', name: '#jm删除 <JM号> [章节|区间] / #jm清缓存', sub: '主人：删除/清空缓存' },
         { no: '', name: '#jm代理 <地址>', sub: 'HTTP/SOCKS5 代理，支持多代理轮换' },
       ]
       const png = await renderListCard({

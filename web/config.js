@@ -23,6 +23,7 @@ export const DEFAULTS = {
   maxPages: 0,           // 0 = 不限制
   pageSize: 24,          // 搜索每页条数
   pageCacheMB: 512,      // 阅读页磁盘缓存上限（MB），0 = 不限
+  mergePageLimit: 350,   // 多个章节合并成单个 PDF 的页数上限（内存安全阀）
   tokens: [],            // 额外访问口令（不含命令行 --token），空 = 只在命令行启用鉴权
   encrypt: 'none',       // none | id | custom（前端默认选中项）
   password: '',          // encrypt=custom 时的默认密码
@@ -36,6 +37,7 @@ const NUM_RANGES = {
   maxPages: [0, 100000],
   pageSize: [6, 60],
   pageCacheMB: [0, 102400],
+  mergePageLimit: [1, 5000],
 }
 
 /** 读取配置（不存在则用默认值）。 */
