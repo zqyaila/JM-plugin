@@ -92,6 +92,13 @@ export function supportGuoba () {
           },
         },
         {
+          field: 'usePageCache',
+          label: '复用网页阅读缓存',
+          helpMessage: '网页端「在线阅读」看过的页会存在本地，群里再下载同一本时直接读取，不重复消耗流量。',
+          bottomHelpMessage: '默认开启。两边共用 data/pages 目录；插件只读，不会改动或删除网页的缓存。',
+          component: 'Switch',
+        },
+        {
           label: '网络代理',
           component: 'SOFT_GROUP_BEGIN',
         },
@@ -132,6 +139,7 @@ export function supportGuoba () {
             imageQuality: cfg.imageQuality ?? 82,
             maxPages: cfg.maxPages ?? 0,
             downloadConcurrency: cfg.downloadConcurrency ?? 4,
+            usePageCache: cfg.usePageCache !== false,
             proxy: cfg.proxy ?? '',
             proxyMode: cfg.proxyMode ?? 'all',
           }
@@ -142,6 +150,7 @@ export function supportGuoba () {
           imageQuality: 82,
           maxPages: 0,
           downloadConcurrency: 4,
+          usePageCache: true,
           proxy: '',
           proxyMode: 'all',
         }

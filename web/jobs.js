@@ -15,7 +15,7 @@ import crypto from 'node:crypto'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 
-import { getCachedPdf, putCachedPdf, cacheKey, DATA_DIR, PDF_DIR } from '../apps/store.js'
+import { getCachedPdf, putCachedPdf, cacheKey, pdfPasswordMatches, DATA_DIR, PDF_DIR } from '../apps/store.js'
 import { buildChapterPdf, buildComicPdf, buildCachedPdf, buildCachedComicPdf, resolveChapters } from '../apps/jm.js'
 import { createZipWriter } from '../apps/zip.js'
 
@@ -167,7 +167,7 @@ export function createJobManager({ client, repo, getConfig, getPage }) {
   async function runSingle(job, cfg, userPassword) {
     const tag = job.whole ? null : rangeTag(job.from, job.to)
     const cached = await getCachedPdf(job.albumId, tag)
-    if (cached && (cached.meta?.userPassword ?? '') === userPassword) {
+    if (cached && pdfPasswordMatches(cached.meta, userPassword, job.ownerPassword || '')) {
       job.cached = true
       job.size = cached.meta.size || 0
       job.title = cached.meta.name || job.title
@@ -324,7 +324,7 @@ export function createJobManager({ client, repo, getConfig, getPage }) {
           } else {
             // 命中缓存（同一密码策略）就直接拿去打包，不重复下载
             const cached = await getCachedPdf(job.albumId, ch.sort)
-            if (cached && (cached.meta?.userPassword ?? '') === userPassword) {
+            if (cached && pdfPasswordMatches(cached.meta, userPassword, job.ownerPassword || '')) {
               parts = [
                 {
                   sort: ch.sort,

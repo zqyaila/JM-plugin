@@ -28,19 +28,106 @@ async function ensureStore() {
   }
 }
 
-/** 读索引（容错，损坏则返回空对象）。 */
+/**
+ * 读索引。
+ *
+ * 文件存在但读不出来（进程被杀时写了一半、磁盘错误）时，先把它改名备份，
+ * 再返回空对象 —— 否则下一次写入会拿空对象把整个索引覆盖掉，几百个 PDF
+ * 全变成「目录里有、索引里没有」的孤儿。
+ */
 async function readIndex() {
+  let raw
   try {
-    const raw = await fsp.readFile(INDEX_FILE, 'utf8')
-    return JSON.parse(raw || '{}')
+    raw = await fsp.readFile(INDEX_FILE, 'utf8')
+  } catch (e) {
+    if (e?.code !== 'ENOENT') {
+      await backupBrokenIndex()
+    }
+    return {}
+  }
+  if (!raw.trim()) return {}
+  try {
+    const json = JSON.parse(raw)
+    return json && typeof json === 'object' ? json : {}
   } catch {
+    await backupBrokenIndex()
     return {}
   }
 }
 
-/** 写索引。 */
+async function backupBrokenIndex() {
+  try {
+    const dest = `${INDEX_FILE}.broken-${Date.now()}`
+    await fsp.rename(INDEX_FILE, dest)
+    console.warn(`[store] index.json 无法解析，已备份为 ${path.basename(dest)}`)
+  } catch {
+    /* 备份失败也别影响读取，最坏是下次重新扫描 */
+  }
+}
+
+/** 原子写：先写临时文件再 rename，读方永远不会看到半个 JSON。 */
 async function writeIndex(index) {
-  await fsp.writeFile(INDEX_FILE, JSON.stringify(index, null, 2), 'utf8')
+  const tmp = `${INDEX_FILE}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`
+  await fsp.writeFile(tmp, JSON.stringify(index, null, 2), 'utf8')
+  await fsp.rename(tmp, INDEX_FILE)
+}
+
+const LOCK_FILE = `${INDEX_FILE}.lock`
+const LOCK_STALE_MS = 5000
+
+/**
+ * 跨进程互斥（O_EXCL 建锁文件）。
+ *
+ * 「写完再读一遍比对」这类乐观校验挡不住 lost update：A 写完、A 验证通过、
+ * B 紧接着覆盖 —— A 的改动就没了。插件进程和 web 进程都会写这个索引，
+ * 必须用真正的互斥；拿不到锁就退避重试，持有者崩溃留下的死锁按 mtime 清掉。
+ */
+async function withIndexLock(fn) {
+  const wait = 15
+  for (let i = 0; i < 200; i++) {
+    let fh = null
+    try {
+      fh = await fsp.open(LOCK_FILE, 'wx')
+    } catch (e) {
+      if (e?.code !== 'EEXIST') throw e
+      try {
+        const st = await fsp.stat(LOCK_FILE)
+        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) await fsp.rm(LOCK_FILE, { force: true })
+      } catch {}
+      await new Promise((r) => setTimeout(r, wait + Math.random() * wait))
+      continue
+    }
+    try {
+      await fh.close()
+      return await fn()
+    } finally {
+      await fsp.rm(LOCK_FILE, { force: true })
+    }
+  }
+  // 3 秒还拿不到锁：不再阻塞业务，直接写（极端情况下宁可丢一条索引，
+  // 文件本身还在，下次 listCache 会把它补登记回来）
+  return await fn()
+}
+
+// 同一进程内的写操作串成一条链：避免自己跟自己抢锁
+let writeChain = Promise.resolve()
+
+/**
+ * 对索引做一次「读-改-写」，全程持有跨进程锁。
+ */
+async function mutateIndex(fn) {
+  const run = () =>
+    withIndexLock(async () => {
+      const index = { ...(await readIndex()) }
+      const before = JSON.stringify(index)
+      const result = await fn(index)
+      // 内容没变就不落盘，少一次写
+      if (JSON.stringify(index) !== before) await writeIndex(index)
+      return result
+    })
+  const task = writeChain.then(run, run)
+  writeChain = task.catch(() => {})
+  return task
 }
 
 /** 生成缓存文件名。整本=id，单章=id_c<章节>，区间/打包=id_<标签>。 */
@@ -75,18 +162,41 @@ export async function getCachedPdf(id, chapterIdx = null) {
 export async function putCachedPdf(id, chapterIdx, buf, meta = {}) {
   await ensureStore()
   const key = cacheKey(id, chapterIdx)
-  await fsp.writeFile(path.join(PDF_DIR, `${key}.pdf`), buf)
-  const index = await readIndex()
-  index[key] = {
-    id,
-    chapter: chapterIdx,
-    file: `${key}.pdf`,
-    size: buf.length,
-    time: Date.now(),
-    ...meta,
-  }
-  await writeIndex(index)
+  const file = path.join(PDF_DIR, `${key}.pdf`)
+  // 先写临时文件再替换：另一个进程正在下载这个 PDF 时，不会读到半个文件
+  const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`
+  await fsp.writeFile(tmp, buf)
+  await fsp.rename(tmp, file)
+  await mutateIndex((index) => {
+    index[key] = {
+      id,
+      chapter: chapterIdx,
+      file: `${key}.pdf`,
+      size: buf.length,
+      time: Date.now(),
+      ...meta,
+    }
+  })
   return key
+}
+
+/**
+ * 这份缓存 PDF 是否与当前要用的密码策略一致。
+ *
+ * 插件（pdfPassword）和网页端（web-config.json 的 encrypt/password）是两套配置，
+ * 同一份文件可能被另一套口令加密过。不一致就不能直接发 —— 用户按提示输的密码
+ * 会打不开。索引重建出来的条目（passwordUnknown）一律视为不一致。
+ *
+ * @param {object|null} meta
+ * @param {string} userPassword 当前需要的打开密码（空串 = 不加密）
+ * @param {string} [ownerPassword] 当前需要的所有者密码（作品 id）
+ */
+export function pdfPasswordMatches(meta, userPassword, ownerPassword = '') {
+  if (!meta) return false
+  if (meta.passwordUnknown) return false
+  if ((meta.userPassword ?? '') !== userPassword) return false
+  if (ownerPassword && meta.ownerPassword && meta.ownerPassword !== ownerPassword) return false
+  return true
 }
 
 /**
@@ -97,31 +207,39 @@ export async function putCachedPdf(id, chapterIdx, buf, meta = {}) {
  */
 export async function removeCachedPdf(id, chapterIdx = null) {
   await ensureStore()
-  const index = await readIndex()
   let removed = 0
 
   if (id === 'all') {
-    for (const key of Object.keys(index)) {
-      const f = path.join(PDF_DIR, `${key}.pdf`)
+    // 以目录为准：索引漏登记的孤儿 PDF 也要删掉，不然「清空」之后磁盘还占着
+    let files = []
+    try {
+      files = await fsp.readdir(PDF_DIR)
+    } catch {
+      files = []
+    }
+    for (const f of files) {
+      if (!f.endsWith('.pdf')) continue
       try {
-        await fsp.rm(f, { force: true })
+        await fsp.rm(path.join(PDF_DIR, f), { force: true })
         removed++
       } catch {}
-      delete index[key]
     }
-    await writeIndex(index)
+    await mutateIndex((index) => {
+      for (const key of Object.keys(index)) delete index[key]
+    })
     return removed
   }
 
   const key = cacheKey(id, chapterIdx)
-  if (index[key]) {
-    try {
-      await fsp.rm(path.join(PDF_DIR, `${key}.pdf`), { force: true })
-      removed = 1
-    } catch {}
-    delete index[key]
-  }
-  await writeIndex(index)
+  const file = path.join(PDF_DIR, `${key}.pdf`)
+  try {
+    await fsp.access(file)
+    await fsp.rm(file, { force: true })
+    removed = 1
+  } catch {}
+  await mutateIndex((index) => {
+    if (index[key]) delete index[key]
+  })
   return removed
 }
 
@@ -156,11 +274,25 @@ export async function listCache() {
         size: st.size,
         time: st.mtimeMs,
         recovered: true,
+        // 文件名里没有密码信息，PDF 本身又是加密的：不知道当初用什么口令生成，
+        // 就不能拿去直接发，否则用户按提示输的密码打不开。当作「密码策略不明」，
+        // 下次按当前配置重新生成一份（也就多一次，之后元数据就补回来了）。
+        passwordUnknown: true,
       }
       dirty = true
     } catch {}
   }
-  if (dirty) await writeIndex(index)
+  if (dirty) {
+    // 只把孤儿合并回去，不整份覆盖：这期间别的进程可能刚写入了新条目
+    const found = {}
+    for (const [key, meta] of Object.entries(index)) {
+      if (meta.recovered) found[key] = meta
+    }
+    await mutateIndex((cur) => {
+      for (const [key, meta] of Object.entries(found)) if (!cur[key]) cur[key] = meta
+    })
+    return Object.values({ ...index, ...(await readIndex()) }).sort((a, b) => b.time - a.time)
+  }
 
   return Object.values(index).sort((a, b) => b.time - a.time)
 }

@@ -28,29 +28,41 @@
 
 import plugin from '../../lib/plugins/plugin.js'
 import makeConfig from '../../lib/plugins/config.js'
+import path from 'node:path'
 import JmClient from './apps/jmcore.js'
 import JmRepository, { buildComicPdf, countComicPages } from './apps/jm.js'
 import { renderDetailCard, renderChaptersCard, renderListCard } from './apps/render.js'
-import { getCachedPdf, putCachedPdf, removeCachedPdf, listCache } from './apps/store.js'
+import { getCachedPdf, putCachedPdf, removeCachedPdf, listCache, pdfPasswordMatches, DATA_DIR } from './apps/store.js'
+import { createPageStore } from './web/pagecache.js'
 import { parseProxyList, maskProxy, testProxy } from './apps/proxy.js'
 
 const client = new JmClient()
 const repo = new JmRepository(client)
 
-// 插件配置：config/jmreader.yaml
-//   pdfPassword:        PDF 通用密码（userPassword），与作品 id（ownerPassword）双密码
-//   pageSize:           列表每页显示条数
-//   imageQuality:       图片质量 0-100
-//   maxPages:           PDF 最大页数限制（0 = 不限制），超过则拒绝并提示
-//   downloadConcurrency: 下载图片并发数（1-10）
-//   proxy:              代理地址（http:// / https:// / socks5://），多个用逗号或换行分隔，留空=直连
-//   proxyMode:          代理生效范围 all（全部）/ api（仅接口）/ image（仅图片）/ off（关闭）
+/**
+ * 网页端「在线阅读」把看过的页存在 data/pages（web/server.js 在另一个进程里写）。
+ * 这里以只读方式复用同一份缓存：群里再要这本时，看过的页直接读盘，只有没看过的
+ * 才联网下载 —— 两边共用目录，但写入权和 LRU 淘汰只归 web 进程，避免互相覆盖。
+ */
+let pageStore = null
+function getPageStore() {
+  if (!pageStore) {
+    pageStore = createPageStore({
+      dir: path.join(DATA_DIR, 'pages'),
+      limitMB: 0, // 只读方不参与容量管理
+      readOnly: true, // 不写索引、不删文件
+    })
+  }
+  return pageStore
+}
+
 const { config, configSave } = await makeConfig('jmreader', {
   pdfPassword: '',
   pageSize: 10,
   imageQuality: 82,
   maxPages: 0,
   downloadConcurrency: 4,
+  usePageCache: true,
   proxy: '',
   proxyMode: 'all',
 })
@@ -75,6 +87,9 @@ globalThis.__jmreaderSetConfig = (data) => {
   if ('downloadConcurrency' in data) {
     const c = parseInt(data.downloadConcurrency, 10)
     config.downloadConcurrency = Number.isFinite(c) && c > 0 ? Math.min(c, 10) : 4
+  }
+  if ('usePageCache' in data) {
+    config.usePageCache = data.usePageCache !== false && data.usePageCache !== 'false'
   }
   if ('proxy' in data) {
     config.proxy = typeof data.proxy === 'string' ? data.proxy.trim() : ''
@@ -177,6 +192,11 @@ export class JMReader extends plugin {
   get downloadConcurrency() {
     const n = parseInt(config.downloadConcurrency, 10)
     return Number.isFinite(n) && n > 0 ? Math.min(n, 10) : 4
+  }
+
+  /** 复用网页端阅读缓存（默认开）。 */
+  get usePageCache() {
+    return config.usePageCache !== false && config.usePageCache !== 'false'
   }
 
   /**
@@ -621,15 +641,31 @@ export class JMReader extends plugin {
       }
     } catch {}
 
-    // 先查缓存
+    // 先查缓存：只有「同一套密码策略」才能直接发。
+    // 网页端可能用别的密码（或干脆不加密）生成过一份，直接发出去用户拿到的口令打不开。
     const cached = await getCachedPdf(id, chapterIdx)
-    if (cached) {
+    if (cached && pdfPasswordMatches(cached.meta, userPassword, ownerPassword)) {
       // 命中缓存，直接发
       const headMsg = `📕《${cached.meta.name || `JM${id}`}》JM${id}（缓存）已生成加密 PDF（${cached.meta.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
       const fileName = `${id}${chapterIdx != null ? `_c${chapterIdx}` : ''}.pdf`
       await this._sendPdfFile(e, cached.file, fileName, headMsg)
       return true
     }
+
+    // 网页端「在线阅读」缓存过的页直接读盘，只有没看过的才联网下载
+    const loadCached =
+      this.usePageCache
+        ? async (cid, p) => {
+            try {
+              const hit = await getPageStore().get(cid, p)
+              return hit?.buf || null
+            } catch {
+              return null
+            }
+          }
+        : null
+    // 只读方拿的是磁盘快照，任务开始前刷新一次，免得网页刚看的新页被漏掉
+    if (loadCached) getPageStore().refresh()
 
     // 估算预计时间（按并发数折算）
     const concurrency = this.downloadConcurrency
@@ -639,7 +675,10 @@ export class JMReader extends plugin {
       const secs = Math.ceil((totalPage * 1.5) / concurrency)
       estimate = `预计 ${totalPage} 页，约 ${secs > 60 ? Math.round(secs / 60) + ' 分钟' : secs + ' 秒'}`
     }
-    await e.reply(`⏳ 正在下载并生成加密 PDF…${estimate ? `\n📊 ${estimate}` : ''}`)
+    await e.reply(
+      `⏳ 正在下载并生成加密 PDF…${estimate ? `\n📊 ${estimate}` : ''}` +
+        (loadCached ? '\n⚡ 网页里看过的页会直接从本地读取，不重复下载' : ''),
+    )
     try {
       await this.ensureBootstrap()
       const result = await buildComicPdf(
@@ -650,7 +689,13 @@ export class JMReader extends plugin {
         userPassword,
         ownerPassword,
         () => {}, // 不逐条发进度，避免刷屏
-        { concurrency, retries: 3, retryDelay: 2000, quality: parseInt(config.imageQuality, 10) || 82 },
+        {
+          concurrency,
+          retries: 3,
+          retryDelay: 2000,
+          quality: parseInt(config.imageQuality, 10) || 82,
+          loadCached,
+        },
       )
       // 持久化缓存
       await putCachedPdf(id, chapterIdx, result.buf, {
@@ -662,7 +707,11 @@ export class JMReader extends plugin {
       const rec = await getCachedPdf(id, chapterIdx)
       const fileName = `${id}${chapterIdx != null ? `_c${chapterIdx}` : ''}.pdf`
 
-      const headMsg = `📕《${result.name}》JM${id} 已生成加密 PDF（${result.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
+      const hitNote =
+        result.cacheHits > 0
+          ? `\n⚡ 其中 ${result.cacheHits}/${result.pageCount} 页取自网页阅读缓存，没有重复下载`
+          : ''
+      const headMsg = `📕《${result.name}》JM${id} 已生成加密 PDF（${result.pageCount} 页）${hitNote}\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
       await this._sendPdfFile(e, rec.file, fileName, headMsg)
     } catch (err) {
       await e.reply(`❌ ${err.serverMessage || err.message || '生成 PDF 失败'}`)

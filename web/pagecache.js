@@ -35,7 +35,13 @@ const TYPE_BY_EXT = {
 
 const MB = 1024 * 1024
 
-export function createPageStore({ dir, limitMB = 512 } = {}) {
+/**
+ * @param {{dir:string, limitMB?:number, readOnly?:boolean}} opts
+ *   readOnly：只读模式。插件本体（Yunzai 进程）与 web 服务是两个进程，共用同一个
+ *   data/pages 目录；只读方绝不写索引、不做淘汰，避免两边互相覆盖 —— 写入与 LRU
+ *   只归 web 进程管。
+ */
+export function createPageStore({ dir, limitMB = 512, readOnly = false } = {}) {
   const chapters = new Map() // cid -> { pages: Map<p, meta>, size, mtime, loaded }
   // 整本读完的章节会被「软钉住」：淘汰时排在最后。否则读一本 300 页的漫画，
   // 读到最后一章时第一章早就被 LRU 踢掉，「整本缓存」永远凑不齐。
@@ -135,6 +141,7 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
   }
 
   function scheduleIndexWrite(cid) {
+    if (readOnly) return // 只读方不写索引，写入权归 web 进程
     const key = String(cid)
     if (indexTimers.has(key)) return
     indexTimers.set(
@@ -170,7 +177,7 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
           if (!name.isDirectory()) continue
           await loadChapter(name.name)
         }
-        await evictIfNeeded('')
+        if (!readOnly) await evictIfNeeded('') // 只读方绝不删别人的文件
       } catch {
         /* 目录读不了就是没有缓存 */
       }
@@ -208,6 +215,7 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
 
   /** 写一页：先落盘再更新索引；索引合并写，避免一页一个 JSON。 */
   async function put(cid, p, item) {
+    if (readOnly) return // 只读方（插件进程）不回写页面缓存
     const key = String(cid)
     const entry = await loadChapter(key)
     const ext = EXT_BY_TYPE[item.type] || 'jpg'
@@ -266,6 +274,7 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
   }
 
   async function removeChapter(cid) {
+    if (readOnly) return // 只读方不删文件
     const key = String(cid)
     const entry = chapters.get(key)
     try {
@@ -317,6 +326,7 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
   }
 
   async function clear() {
+    if (readOnly) return
     for (const timer of indexTimers.values()) clearTimeout(timer)
     indexTimers.clear()
     await fsp.rm(dir, { recursive: true, force: true })
@@ -331,7 +341,20 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
     void evictIfNeeded('')
   }
 
-  void init()
+  /**
+   * 丢掉内存里的章节索引，下次 get 重新从磁盘读。
+   *
+   * 插件进程是只读方，另一个进程随时可能往 data/pages 里写新页；不清一下，
+   * 它会一直用「进程启动时那一刻」的旧快照，网页刚看过的页还是当没缓存。
+   * 每次下载任务开始前调用一次即可，任务内部仍然复用。
+   */
+  function refresh() {
+    chapters.clear()
+    totalBytes = 0
+  }
+
+  // 只读方懒加载：用到哪一章才读哪一章，不在插件启动时把整个目录扫一遍
+  if (!readOnly) void init()
 
   return {
     get,
@@ -344,6 +367,7 @@ export function createPageStore({ dir, limitMB = 512 } = {}) {
     stats,
     clear,
     setLimitMB,
+    refresh,
     init,
     removeChapter,
   }
