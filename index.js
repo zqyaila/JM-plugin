@@ -86,29 +86,23 @@ const { config, configSave } = await makeConfig('jmreader', {
 globalThis.__jmreaderConfig = config
 globalThis.__jmreaderSetConfig = (data) => {
   if (!data || typeof data !== 'object') return
-  if ('pdfPassword' in data) config.pdfPassword = data.pdfPassword ?? ''
-  if ('pageSize' in data) {
-    const n = parseInt(data.pageSize, 10)
-    config.pageSize = Number.isFinite(n) && n > 0 ? Math.min(n, 20) : 10
+  // 锅巴提交的值可能是 number、字符串，甚至空串（用户清空了输入框）。
+  // 统一走 clampNum，空值/非法值回落到默认值，不会把 350 写成 NaN。
+  const clampNum = (raw, min, max, def) => {
+    if (raw === '' || raw == null) return def
+    const n = parseInt(raw, 10)
+    if (!Number.isFinite(n)) return def
+    return Math.min(Math.max(n, min), max)
   }
-  if ('imageQuality' in data) {
-    const q = parseInt(data.imageQuality, 10)
-    config.imageQuality = Number.isFinite(q) && q >= 0 ? Math.min(q, 100) : 82
-  }
-  if ('maxPages' in data) {
-    const m = parseInt(data.maxPages, 10)
-    config.maxPages = Number.isFinite(m) && m > 0 ? m : 0
-  }
-  if ('downloadConcurrency' in data) {
-    const c = parseInt(data.downloadConcurrency, 10)
-    config.downloadConcurrency = Number.isFinite(c) && c > 0 ? Math.min(c, 10) : 4
-  }
-  if ('mergePageLimit' in data) {
-    const n = parseInt(data.mergePageLimit, 10)
-    config.mergePageLimit = Number.isFinite(n) && n > 0 ? Math.min(n, 5000) : 350
-  }
+
+  if ('pdfPassword' in data) config.pdfPassword = String(data.pdfPassword ?? '')
+  if ('pageSize' in data) config.pageSize = clampNum(data.pageSize, 1, 20, 10)
+  if ('imageQuality' in data) config.imageQuality = clampNum(data.imageQuality, 1, 100, 82)
+  if ('maxPages' in data) config.maxPages = clampNum(data.maxPages, 0, 100000, 0)
+  if ('downloadConcurrency' in data) config.downloadConcurrency = clampNum(data.downloadConcurrency, 1, 10, 4)
+  if ('mergePageLimit' in data) config.mergePageLimit = clampNum(data.mergePageLimit, 1, 5000, 350)
   if ('usePageCache' in data) {
-    config.usePageCache = data.usePageCache !== false && data.usePageCache !== 'false'
+    config.usePageCache = !(data.usePageCache === false || data.usePageCache === 'false' || data.usePageCache === 0 || data.usePageCache === '0')
   }
   if ('proxy' in data) {
     config.proxy = typeof data.proxy === 'string' ? data.proxy.trim() : ''
@@ -117,7 +111,12 @@ globalThis.__jmreaderSetConfig = (data) => {
     const m = String(data.proxyMode || '').toLowerCase()
     config.proxyMode = ['all', 'api', 'image', 'off'].includes(m) ? m : 'all'
   }
-  configSave().catch(() => {})
+  // configSave 在部分宿主里是 debounce 包装，返回 undefined 而不是 Promise，
+  // 直接 .catch 会抛 TypeError，导致整次保存失败。
+  try {
+    const ret = configSave()
+    if (ret && typeof ret.catch === 'function') ret.catch(() => {})
+  } catch {}
 }
 
 export class JMReader extends plugin {
@@ -147,6 +146,7 @@ export class JMReader extends plugin {
         { reg: new RegExp('^#?jm(下一页|下页|next)\\s*$', 'i'), fnc: 'nextPage' },
         { reg: new RegExp('^#?jm(上一页|上页|prev|previous)\\s*$', 'i'), fnc: 'prevPage' },
         { reg: new RegExp('^#?jm(删除|删|del|delete)\\s*(.*)$', 'i'), fnc: 'delResource', permission: 'master' },
+        { reg: new RegExp('^#?jm(配置|config|设置)\\s*$', 'i'), fnc: 'showConfig', permission: 'master' },
         { reg: new RegExp('^#?jm(清缓存|清除缓存|clearcache)\\s*$', 'i'), fnc: 'clearCache', permission: 'master' },
         { reg: new RegExp('^#?jm(缓存列表|缓存|cache)\\s*$', 'i'), fnc: 'cacheList', permission: 'master' },
       ],
@@ -904,6 +904,32 @@ export class JMReader extends plugin {
     return true
   }
 
+  /** 主人查看当前生效配置（锅巴面板改完可以用它核对有没有真的生效）。 */
+  async showConfig(e) {
+    const num = (v, def) => {
+      const n = parseInt(v, 10)
+      return Number.isFinite(n) ? n : def
+    }
+    const proxies = String(config.proxy || '').split(/[,，\n]+/).map((s) => s.trim()).filter(Boolean)
+    const modes = { all: '全部流量', api: '仅接口', image: '仅图片', off: '关闭' }
+    const mode = modes[String(config.proxyMode || 'all').toLowerCase()] || '全部流量'
+    const lines = [
+      '⚙️ JMReader 当前配置',
+      '文件：config/jmreader.yaml（锅巴保存后即时生效）',
+      '',
+      `· 通用密码：${config.pdfPassword ? '已设置' : '未设置（只能用作品ID打开）'}`,
+      `· 每页条数：${this.pageSize}`,
+      `· 图片质量：${num(config.imageQuality, 82)}`,
+      `· PDF 页数上限：${this.maxPages ? `${this.maxPages} 页` : '不限制'}`,
+      `· 下载并发：${this.downloadConcurrency}`,
+      `· 合并 PDF 上限：${this.mergePageLimit} 页`,
+      `· 复用网页缓存：${this.usePageCache ? '开' : '关'}`,
+      `· 代理：${proxies.length ? `${proxies.length} 个（${mode}）` : `未设置（${mode}）`}`,
+    ]
+    await e.reply(lines.join('\n'))
+    return true
+  }
+
   /** 主人清空全部缓存。 */
   async clearCache(e) {
     const n = await removeCachedPdf('all')
@@ -944,6 +970,7 @@ export class JMReader extends plugin {
         { no: '', name: '#jm热门 / #jm随机 / #jm分类', sub: '发现作品' },
         { no: '', name: '#jm登录 / #jm退出 / #jm收藏 / #jm历史', sub: '会员功能' },
         { no: '', name: '#jm删除 <JM号> [章节|区间] / #jm清缓存', sub: '主人：删除/清空缓存' },
+        { no: '', name: '#jm配置', sub: '主人：查看当前生效配置（核对面板有没有保存成功）' },
         { no: '', name: '#jm代理 <地址>', sub: 'HTTP/SOCKS5 代理，支持多代理轮换' },
       ]
       const png = await renderListCard({

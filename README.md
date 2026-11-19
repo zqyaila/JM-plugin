@@ -399,6 +399,7 @@ http://127.0.0.1:7890, socks5://127.0.0.1:1080
 | `#jm删除 <JM号> [章节|区间]` | **主人**：删除缓存 PDF（如 `#jm删除 123456 1-5`） |
 | `#jm清缓存` | **主人**：清空全部缓存 |
 | `#jm缓存` | **主人**：查看缓存列表 |
+| `#jm配置` | **主人**：查看当前生效配置（核对锅巴面板有没有保存成功） |
 | `#jm代理 <地址>` | 设置代理（支持 http / https / socks5，多个用逗号分隔） |
 | `#jm代理 范围 api\|image\|all` | 设置代理生效范围 |
 | `#jm代理 测试` | 测试当前代理连通性 |
@@ -452,9 +453,11 @@ jmreader-plugin/
 ```yaml
 pdfPassword: ''        # PDF 通用密码（userPassword），与作品ID（ownerPassword）构成双密码
 pageSize: 10           # 列表每页显示条数（1-20）
-imageQuality: 82       # PDF 内页 JPEG 压缩质量（0-100）
+imageQuality: 82       # PDF 内页 JPEG 压缩质量（1-100）
 maxPages: 0            # PDF 最大页数限制（0 = 不限制），超过则拒绝并提示
 downloadConcurrency: 4 # 下载图片并发数（1-10）
+mergePageLimit: 350    # 多章合并成一个 PDF 的页数上限（1-5000）
+usePageCache: true     # 复用网页端「在线阅读」留下的页缓存
 proxy: ''              # 代理地址，如 http://127.0.0.1:7890；多个用逗号分隔；留空=直连
 proxyMode: all         # 代理生效范围：all / api / image / off
 ```
@@ -480,10 +483,19 @@ proxyMode: all         # 代理生效范围：all / api / image / off
 | `imageQuality` | InputNumber | 图片压缩质量（0-100） |
 | `maxPages` | InputNumber | PDF 最大页数限制（0 = 不限制） |
 | `downloadConcurrency` | InputNumber | 下载图片并发数（1-10） |
+| `mergePageLimit` | InputNumber | 多章合并成一个 PDF 的页数上限（1-5000，默认 350） |
+| `usePageCache` | Switch | 复用网页端阅读缓存 |
 | `proxy` | InputTextArea | 代理地址，可填多个（逗号/换行分隔） |
 | `proxyMode` | Select | 代理生效范围 all / api / image / off |
 
-锅巴面板保存时，会通过全局钩子回写到 `config/jmreader.yaml` 并即时生效。
+锅巴面板保存时优先走 `index.js` 注册的全局钩子（改内存 + 写 `config/jmreader.yaml`，即时生效）；插件没加载时直接改这份 yaml 兜底，所以不会出现「点了保存没反应」。
+
+> **面板里找不到「合并 PDF 页数上限」或改了不生效？**
+>
+> 1. 这一项是 v1.6.4 加的。锅巴在启动时缓存 `guoba.support.js`，更新插件后必须**重启一次云崽**（或在面板里重载插件），新字段才会出现。
+> 2. 保存后看提示：显示「已保存（插件未运行，重启后生效）」说明走的是文件兜底通道，重启即可；显示「保存成功~」说明已即时生效。
+> 3. 想确认写到哪了，直接看 `config/jmreader.yaml` 里的 `mergePageLimit`。
+> 4. 网页版的合并上限是另一份配置（`data/web-config.json`，在网页右上角设置里改），与插件这份互不影响。
 
 ## 网页「加载慢 / 打不开」排查
 
