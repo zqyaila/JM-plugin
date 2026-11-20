@@ -133,8 +133,11 @@ export function createOfflineIndex({ file, pages } = {}) {
     return alb
   }
 
-  /** 逐章核对缓存：返回覆盖率，未登记的章节按「未缓存」算。 */
-  async function coverage(albumId) {
+  /**
+   * 逐章核对缓存：返回覆盖率，未登记的章节按「未缓存」算。
+   * @param {{skipSize?:boolean}} [opts] skipSize=true 时不算磁盘占用（插件端只关心齐没齐）
+   */
+  async function coverage(albumId, opts = {}) {
     await load()
     const alb = data.albums[String(albumId)]
     if (!alb) return null
@@ -154,7 +157,7 @@ export function createOfflineIndex({ file, pages } = {}) {
       if (complete) chaptersCached += 1
       pagesTotal += ch.pages
       pagesCached += cached
-      size += await pages.chapterSize(ch.cid).catch(() => 0)
+      if (!opts.skipSize) size += await pages.chapterSize(ch.cid).catch(() => 0)
       chapters.push({
         sort: ch.sort,
         cid: ch.cid,

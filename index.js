@@ -31,11 +31,13 @@ import makeConfig from '../../lib/plugins/config.js'
 import path from 'node:path'
 import fsp from 'node:fs/promises'
 import JmClient from './apps/jmcore.js'
-import JmRepository, { buildComicPdf, buildChapterPdf, resolveChapters, countComicPages } from './apps/jm.js'
+import JmRepository, { buildComicPdf, buildChapterPdf, buildCachedComicPdf, resolveChapters, countComicPages } from './apps/jm.js'
 import { renderDetailCard, renderChaptersCard, renderListCard } from './apps/render.js'
 import { getCachedPdf, putCachedPdf, removeCachedPdf, listCache, pdfPasswordMatches, DATA_DIR } from './apps/store.js'
 import { createPageStore } from './web/pagecache.js'
+import { createOfflineIndex } from './web/offline.js'
 import { parseChapterArg, chapterSuffix } from './apps/chapter-range.js'
+import { planFromCoverage } from './apps/offline-plan.js'
 import { parseProxyList, maskProxy, testProxy } from './apps/proxy.js'
 
 const client = new JmClient()
@@ -56,6 +58,21 @@ function getPageStore() {
     })
   }
   return pageStore
+}
+
+/**
+ * 网页端「整本看完了」的登记簿（data/offline.json），同样只读。
+ * 有它才能在不请求任何接口的情况下，判断这一本/这一段能不能纯本地出 PDF。
+ */
+let offlineIndex = null
+function getOfflineIndex() {
+  if (!offlineIndex) {
+    offlineIndex = createOfflineIndex({
+      file: path.join(DATA_DIR, 'offline.json'),
+      pages: getPageStore(),
+    })
+  }
+  return offlineIndex
 }
 
 const TMP_DIR = path.join(DATA_DIR, 'tmp')
@@ -665,8 +682,98 @@ export class JMReader extends plugin {
     const userPassword = commonPwd
     const ownerPassword = id
 
-    // 最大页数限制 + 预计时间：用 comicRead 拿真实页数（含单行本）
     const maxPages = this.maxPages
+    // 页数越多 WASM 内存峰值越高，这个值可以在锅巴/网页里改，方便自己试机器能扛多少页。
+    const mergeLimit = this.mergePageLimit
+    const concurrency = this.downloadConcurrency
+    const quality = parseInt(config.imageQuality, 10) || 82
+
+    // 网页端「在线阅读」缓存过的页直接读盘，只有没看过的才联网下载
+    const loadCached = this.usePageCache
+      ? async (cid, p) => {
+          try {
+            const hit = await getPageStore().get(cid, p)
+            return hit?.buf || null
+          } catch {
+            return null
+          }
+        }
+      : null
+
+    // ① 已经生成过的 PDF：同一套密码策略就直接发，连页表都不用查。
+    //    分章模式不能走这里 —— 区间单文件缓存 `_r1-5.pdf` 不是用户要的「每章一个」。
+    const cached = split ? null : await getCachedPdf(id, chapterIdx)
+    if (cached && pdfPasswordMatches(cached.meta, userPassword, ownerPassword)) {
+      const headMsg = `📕《${cached.meta.name || `JM${id}`}》JM${id}（缓存）已生成加密 PDF（${cached.meta.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
+      const fileName = `${id}${chapterSuffix(chapterIdx)}.pdf`
+      await this._sendPdfFile(e, cached.file, fileName, headMsg)
+      return true
+    }
+
+    // ② 网页端已经把这一段看全了：纯本地排版，不发任何网络请求。
+    //    这条路上「35 页」不是下载 35 页，是读 35 个本地文件，通常一两秒就完。
+    let plan = null
+    if (!split) {
+      plan = await this.offlinePlan(id, chapterIdx)
+      if (plan?.ready) {
+        if (maxPages > 0 && plan.pages > maxPages) {
+          await e.reply(
+            `❌ ${label}共 ${plan.pages} 页，超过最大页数限制（${maxPages} 页）\n` +
+              `可以缩小范围，例如 #jm${id} 1-3；或联系主人调高上限`,
+          )
+          return true
+        }
+        if (plan.pages > mergeLimit) {
+          await e.reply(
+            `❌ ${label}共 ${plan.pages} 页，超过单个 PDF 的合并上限（${mergeLimit} 页）。\n` +
+              `· 分章发送：#jm${id} ${argRaw || '1-x'} --split（同样只读本地缓存）\n` +
+              `· 缩小范围后重试\n` +
+              `· 主人可在锅巴面板调高「合并 PDF 页数上限」（当前 ${mergeLimit}）`,
+          )
+          return true
+        }
+
+        await e.reply(
+          `⚡ 本地缓存已齐全，正在合成加密 PDF…\n` +
+            `📊 ${plan.pages} 页全部来自网页阅读缓存，不联网`,
+        )
+        try {
+          // 只读方拿的是磁盘快照，排版前刷新一次，免得网页刚看的新页被漏掉
+          getPageStore().refresh()
+          const result = await buildCachedComicPdf(
+            plan.chapters,
+            {
+              getPage: loadCached,
+              userPassword,
+              ownerPassword,
+              quality,
+              maxPagesPerFile: mergeLimit,
+            },
+          )
+          await putCachedPdf(id, chapterIdx, result.buf, {
+            name: plan.name || `JM${id}`,
+            pageCount: result.pageCount,
+            userPassword,
+            ownerPassword,
+            source: 'cache',
+          })
+          const rec = await getCachedPdf(id, chapterIdx)
+          const fileName = `${id}${chapterSuffix(chapterIdx)}.pdf`
+          const headMsg =
+            `📕《${plan.name || `JM${id}`}》JM${id} 已生成加密 PDF（${result.pageCount} 页）` +
+            `\n⚡ 全部取自网页阅读缓存，没有重新下载` +
+            `\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
+          await this._sendPdfFile(e, rec.file, fileName, headMsg)
+          return true
+        } catch (err) {
+          // 登记簿说齐了、磁盘上却被清掉/换了页：别在这里失败，退回联网补全
+          await e.reply(`⚠️ 本地缓存有页读不出来（${err?.message || '未知原因'}），改为联网补全…`)
+          plan = null
+        }
+      }
+    }
+
+    // ③ 需要联网：先拿真实页数（含单行本），再做上限检查
     let totalPage = 0
     try {
       await this.ensureBootstrap()
@@ -686,20 +793,7 @@ export class JMReader extends plugin {
       return true
     }
 
-    // 先查缓存：只有「同一套密码策略」才能直接发。
-    // 网页端可能用别的密码（或干脆不加密）生成过一份，直接发出去用户拿到的口令打不开。
-    const cached = await getCachedPdf(id, chapterIdx)
-    if (cached && pdfPasswordMatches(cached.meta, userPassword, ownerPassword)) {
-      // 命中缓存，直接发
-      const headMsg = `📕《${cached.meta.name || `JM${id}`}》JM${id}（缓存）已生成加密 PDF（${cached.meta.pageCount} 页）\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
-      const fileName = `${id}${chapterSuffix(chapterIdx)}.pdf`
-      await this._sendPdfFile(e, cached.file, fileName, headMsg)
-      return true
-    }
-
     // 没有缓存才需要现场合并，这时才看上限 —— 已经生成好的文件不该被新上限拦下。
-    // 页数越多 WASM 内存峰值越高，这个值可以在锅巴/网页里改，方便自己试机器能扛多少页。
-    const mergeLimit = this.mergePageLimit
     if (totalPage > mergeLimit) {
       await e.reply(
         `❌ ${label}共 ${totalPage} 页，超过单个 PDF 的合并上限（${mergeLimit} 页）。\n` +
@@ -710,35 +804,32 @@ export class JMReader extends plugin {
       return true
     }
 
-    // 网页端「在线阅读」缓存过的页直接读盘，只有没看过的才联网下载
-    const loadCached =
-      this.usePageCache
-        ? async (cid, p) => {
-            try {
-              const hit = await getPageStore().get(cid, p)
-              return hit?.buf || null
-            } catch {
-              return null
-            }
-          }
-        : null
-    // 只读方拿的是磁盘快照，任务开始前刷新一次，免得网页刚看的新页被漏掉
-    if (loadCached) getPageStore().refresh()
+    // 本地已经看过多少页：只影响提示文案和预计时间，不影响实际生成
+    const localPages = plan ? Math.min(plan.cached, totalPage || plan.cached) : 0
+    const need = totalPage > 0 ? Math.max(0, totalPage - localPages) : 0
+    const fmtSecs = (secs) => (secs > 60 ? `${Math.round(secs / 60)} 分钟` : `${secs} 秒`)
 
-    // 估算预计时间（按并发数折算）
-    const concurrency = this.downloadConcurrency
     let estimate = ''
     if (totalPage > 0) {
-      // 每页约 1.5s，并发后总时间 ≈ 页数 × 1.5 / 并发
-      const secs = Math.ceil((totalPage * 1.5) / concurrency)
-      estimate = `预计 ${totalPage} 页，约 ${secs > 60 ? Math.round(secs / 60) + ' 分钟' : secs + ' 秒'}`
+      if (localPages > 0 && need === 0) {
+        estimate = `共 ${totalPage} 页，本地已有 ${localPages} 页，无需联网`
+      } else if (localPages > 0) {
+        const secs = Math.ceil((need * 1.5) / concurrency)
+        estimate = `共 ${totalPage} 页，本地已有 ${localPages} 页，剩余 ${need} 页联网下载（约 ${fmtSecs(secs)}）`
+      } else {
+        const secs = Math.ceil((totalPage * 1.5) / concurrency)
+        estimate = `预计 ${totalPage} 页，约 ${fmtSecs(secs)}`
+      }
     }
     await e.reply(
-      `⏳ 正在下载并生成加密 PDF…${estimate ? `\n📊 ${estimate}` : ''}` +
-        (loadCached ? '\n⚡ 网页里看过的页会直接从本地读取，不重复下载' : ''),
+      (localPages > 0 ? '⚡ 正在用本地缓存生成加密 PDF…' : '⏳ 正在下载并生成加密 PDF…') +
+        (estimate ? `\n📊 ${estimate}` : '') +
+        (loadCached && localPages === 0 ? '\n⚡ 网页里看过的页会直接从本地读取，不重复下载' : ''),
     )
     try {
       await this.ensureBootstrap()
+      // 只读方拿的是磁盘快照，任务开始前刷新一次，免得网页刚看的新页被漏掉
+      if (loadCached) getPageStore().refresh()
       const result = await buildComicPdf(
         client,
         repo,
@@ -751,7 +842,7 @@ export class JMReader extends plugin {
           concurrency,
           retries: 3,
           retryDelay: 2000,
-          quality: parseInt(config.imageQuality, 10) || 82,
+          quality,
           maxPagesPerFile: mergeLimit,
           loadCached,
         },
@@ -770,7 +861,7 @@ export class JMReader extends plugin {
         result.cacheHits > 0
           ? `\n⚡ 其中 ${result.cacheHits}/${result.pageCount} 页取自网页阅读缓存，没有重复下载`
           : ''
-      const headMsg = `📕《${result.name}》JM${id} 已生成加密 PDF（${result.pageCount} 页）${hitNote}\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
+      const headMsg = `📕《${result.name || `JM${id}`}》JM${id} 已生成加密 PDF（${result.pageCount} 页）${hitNote}\n🔑 密码：通用密码「${userPassword || '（空）'}」或 作品ID「${id}」二选一即可打开`
       await this._sendPdfFile(e, rec.file, fileName, headMsg)
     } catch (err) {
       const msg = err?.serverMessage || err?.message || '生成 PDF 失败'
@@ -781,6 +872,26 @@ export class JMReader extends plugin {
       await e.reply(`❌ ${msg}${tip}`)
     }
     return true
+  }
+
+  /**
+   * 纯本地判断：网页端有没有把这次要的范围看全。
+   * 只读 data/offline.json 与 data/pages，不发任何网络请求。
+   *
+   * @param {string} id JM 号
+   * @param {number|null|{from:number,to:number|null}} chapterIdx 章节范围
+   * @returns {Promise<null|{ready:boolean, chapters:Array, pages:number, cached:number, expect:number}>}
+   */
+  async offlinePlan(id, chapterIdx) {
+    if (!this.usePageCache) return null
+    let cov
+    try {
+      // 插件端只关心「齐没齐」，不用统计磁盘占用
+      cov = await getOfflineIndex().coverage(id, { skipSize: true })
+    } catch {
+      return null
+    }
+    return planFromCoverage(cov, chapterIdx)
   }
 
   /**
