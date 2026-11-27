@@ -886,6 +886,10 @@ export class JMReader extends plugin {
     if (!this.usePageCache) return null
     let cov
     try {
+      // 插件是常驻进程，只读 pageStore 的章节列表是「本进程第一次用到时」的磁盘快照。
+      // 云崽跑几天不重启的话，网页后来缓存的新章它根本看不见，覆盖率会算成 0，
+      // 于是明明看完了还走联网。判定前先丢掉快照，让 pageNumbers 重新读目录。
+      getPageStore().refresh()
       // 插件端只关心「齐没齐」，不用统计磁盘占用
       cov = await getOfflineIndex().coverage(id, { skipSize: true })
     } catch {

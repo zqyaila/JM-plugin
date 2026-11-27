@@ -1,6 +1,6 @@
 {
   "name": "jmreader-plugin",
-  "version": "1.6.6",
+  "version": "1.6.7",
   "description": "JM Reader 漫画阅读器 —— TRSS-Yunzai 插件 + Web PDF 下载器（搜索/详情/阅读/代理/导 PDF）",
   "type": "module",
   "main": "index.js",

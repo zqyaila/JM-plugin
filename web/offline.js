@@ -29,11 +29,14 @@ export function createOfflineIndex({ file, pages } = {}) {
   let timer = null
   let writing = null
   let dirty = false
+  let loadedMtime = 0
 
   async function load() {
     if (ready) return ready
     ready = (async () => {
       try {
+        const st = await fsp.stat(file)
+        loadedMtime = st.mtimeMs
         const raw = await fsp.readFile(file, 'utf8')
         const json = JSON.parse(raw)
         if (json && typeof json === 'object' && json.albums) {
@@ -87,6 +90,9 @@ export function createOfflineIndex({ file, pages } = {}) {
         const tmp = `${file}.tmp`
         await fsp.writeFile(tmp, body, 'utf8')
         await fsp.rename(tmp, file)
+        try {
+          loadedMtime = (await fsp.stat(file)).mtimeMs
+        } catch {}
       } catch {
         // 写不进去不影响阅读，最坏是重启后要重看一章才有记录
       } finally {
@@ -106,12 +112,36 @@ export function createOfflineIndex({ file, pages } = {}) {
   }
 
   /**
+   * 别人（另一个进程）改过 offline.json 就重读一次。
+   *
+   * 插件和网页是两个进程：网页每打开一章都会往里写，插件却只在启动时读一次内存副本。
+   * 云崽常驻几天不重启，插件就永远看不到后来缓存的新章 —— 明明看完了还判成「没缓存」，
+   * 于是又去联网下一遍。这里按 mtime 判断，别人改了才重读。
+   *
+   * 自己有未落盘的修改时跳过（否则会把刚 recordChapter 的章节覆盖掉）。
+   */
+  async function syncFromDisk() {
+    if (dirty || writing) return
+    let st
+    try {
+      st = await fsp.stat(file)
+    } catch {
+      return
+    }
+    if (st.mtimeMs <= loadedMtime) return
+    ready = null
+    await load()
+  }
+
+  /**
    * 登记一章。同一章重复打开只刷新页码与时间（页数可能因修图变了）。
    * @param {{albumId:string, albumName:string, totalChapters:number,
    *          sort:number, cid:string, name?:string, pages:number}} input
    */
   async function recordChapter({ albumId, albumName, totalChapters, sort, cid, name, pages: pageCount }) {
     await load()
+    // 别的进程刚记过章的话先合并进来，别拿旧内存副本把它盖掉
+    await syncFromDisk()
     const id = String(albumId || '')
     const s = Number(sort) || 0
     const n = Number(pageCount) || 0
@@ -139,6 +169,7 @@ export function createOfflineIndex({ file, pages } = {}) {
    */
   async function coverage(albumId, opts = {}) {
     await load()
+    await syncFromDisk()
     const alb = data.albums[String(albumId)]
     if (!alb) return null
 
@@ -189,6 +220,7 @@ export function createOfflineIndex({ file, pages } = {}) {
   /** 所有登记过的作品（只回摘要，够列表用）。 */
   async function list() {
     await load()
+    await syncFromDisk()
     return Object.values(data.albums)
       .sort((a, b) => (b.time || 0) - (a.time || 0))
       .map((alb) => ({
@@ -203,6 +235,7 @@ export function createOfflineIndex({ file, pages } = {}) {
   /** 整本已缓存的作品的章节 id，用来钉住不被 LRU 淘汰。 */
   async function pinnedChapters() {
     await load()
+    await syncFromDisk()
     const out = []
     for (const alb of Object.values(data.albums)) {
       if (!alb.total || Object.keys(alb.chapters).length < alb.total) continue
